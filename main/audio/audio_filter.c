@@ -52,7 +52,7 @@ void audio_filter_dc_block(audio_filter_state_t *state, int16_t *samples, size_t
 
     float y_prev = state->dc_y;
     float x_prev = state->dc_x;
-    const float R = 0.985f; // ~80 Hz high-pass cutoff at 16 kHz
+    const float R = 0.985f; // ~19 Hz high-pass at 8 kHz (scales with the sample rate)
 
     for (size_t i = 0; i < count; i++) {
         float x = (float)samples[i];

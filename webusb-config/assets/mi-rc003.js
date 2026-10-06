@@ -60,6 +60,10 @@
     BLE_UNPAIR: 0x22,
     BLE_INFO: 0x23,
     BLE_RECONNECT: 0x24,
+    BLE_RAW_REPORT: 0x25,
+    BLE_LAYOUT: 0x26,
+    KEY_NAMES_GET: 0x27,
+    KEY_NAMES_SET: 0x28,
     NVS_RESET: 0x31,
     SYSTEM_RESTART: 0x40,
   };
@@ -117,10 +121,36 @@
   /** Gesture keys used by Keymap helpers. */
   var GESTURES = { CLICK: "click", LONG: "long", DOUBLE: "double", REPEAT: "repeat" };
 
-  /** Physical remote keys (canonical `source_vk` values). */
+  /**
+   * Physical remote keys (canonical `source_vk` values).
+   *
+   * The array index **is** the physical slot: the firmware resolves whatever a
+   * remote reports into one of these canonical key codes, and the code's
+   * position here is the slot it lands in. Nothing downstream guesses what a
+   * button *means* any more - the slot is the identity, and both the display
+   * name and the emitted action are user-editable.
+   *
+   * This array is **not** an index table for any remote. A remote's raw report
+   * index is only unique *within a single HID report*: the Google TV Remote
+   * (ZTKA-IR57) exposes two report characteristics that each count from 1
+   * (main 0x0021: 1 Up, 2 Down, ...; secondary 0x001D: 1 Volume+, 2 Volume-),
+   * so "index N -> slot N-1" holds for neither report. The firmware maps the
+   * pair (report, index) to a canonical code instead, which is why "index 1"
+   * can be either the D-pad Up (slot 2) or Volume+ (slot 10). To see the raw
+   * numbers, enable `raw report` and read the device log line
+   * `HOGP: button chr#N idx=M -> key 0xXX (name) DOWN`.
+   *
+   * The order below is therefore only the historical default guess (the standard
+   * Google TV remote button order: index 1 Power | 2 Assistant | 3-6 D-pad |
+   * 7 Select | 8 Back | 9 Home | 10 Menu | 11-12 Volume | 13 Input, then Mute
+   * and the two preset-app buttons that only some variants carry). On a remote
+   * whose reports differ, the built-in label for a slot will not match the
+   * physical button - that is expected, and the fix is to rename the slot in the
+   * UI ("按键学习" tab) rather than to reorder this array.
+   */
   var PHYSICAL_KEYS = [
     { vk: 0x66, name: "电源键" },
-    { vk: 0x04, name: "语音键" },
+    { vk: 0x04, name: "语音键 / 助手" },
     { vk: 0x52, name: "方向上" },
     { vk: 0x51, name: "方向下" },
     { vk: 0x50, name: "方向左" },
@@ -131,8 +161,33 @@
     { vk: 0x5d, name: "菜单键" },
     { vk: 0x80, name: "音量+" },
     { vk: 0x81, name: "音量-" },
-    { vk: 0xc0, name: "电视键" },
+    { vk: 0xc0, name: "输入源键" },
+    { vk: 0x7d, name: "静音键" },
+    { vk: 0x7e, name: "预置应用 1" },
+    { vk: 0x7f, name: "预置应用 2" },
   ];
+
+  /** Number of physical slots the firmware exposes (== PHYSICAL_KEYS.length). */
+  var KEY_SLOT_COUNT = PHYSICAL_KEYS.length;
+
+  /**
+   * UTF-8 byte budget for a custom key name, enforced by the firmware.
+   *
+   * It is a *byte* limit, not a character count: a Chinese name costs 3 bytes per
+   * character, so only 10 of them fit. The firmware truncates blindly, which can
+   * split a multi-byte character in half, so {@link MiRC003#setKeyName} truncates
+   * on a character boundary first.
+   */
+  var KEY_NAME_MAX_BYTES = 31;
+
+  /**
+   * Frozen snapshot of the built-in labels, captured before any custom name is
+   * applied, so the UI can show "default name" and restore it.
+   *
+   * Do not replace this with a live view of `PHYSICAL_KEYS[i].name`: the UI
+   * writes user names into that field.
+   */
+  var DEFAULT_KEY_NAMES = PHYSICAL_KEYS.map(function (k) { return k.name; });
 
   /**
    * Factory default configuration-switch map. While the switch mode is active,
@@ -499,6 +554,44 @@
    * 3. MiRC003 client
    * ======================================================================== */
 
+  /* ------------------------------ text helpers --------------------------- */
+
+  var TEXT_ENCODER = new TextEncoder();
+
+  /** Normalize a name table from the device into KEY_SLOT_COUNT strings. */
+  function normalizeNames(list) {
+    var out = [];
+    for (var i = 0; i < KEY_SLOT_COUNT; i++) {
+      out.push(list && typeof list[i] === "string" ? list[i] : "");
+    }
+    return out;
+  }
+
+  /**
+   * Truncate a string so its UTF-8 encoding fits in `maxBytes`, without ever
+   * splitting a character (a surrogate pair counts as one).
+   *
+   * The firmware enforces the same limit but cuts on a raw byte boundary, which
+   * can leave a half-encoded character behind. Truncating here first means what
+   * the user sees in the input is exactly what the device stores.
+   */
+  function truncateUtf8(str, maxBytes) {
+    var s = String(str == null ? "" : str);
+    var limit = maxBytes > 0 ? maxBytes : 0;
+    var used = 0;
+    var out = "";
+    for (var i = 0; i < s.length; i++) {
+      var cp = s.codePointAt(i);
+      var ch = String.fromCodePoint(cp);
+      if (cp > 0xffff) i++;  // surrogate pair: the character spans two code units
+      var n = TEXT_ENCODER.encode(ch).length;
+      if (used + n > limit) break;
+      used += n;
+      out += ch;
+    }
+    return out;
+  }
+
   /**
    * @constructor
    * @param {object} [options]
@@ -756,6 +849,71 @@
   /** Reconnect to the bound remote. */
   MiRC003.prototype.bleReconnect = function () { return this.send(CMD.BLE_RECONNECT); };
 
+  /**
+   * Dump the next few HID notifications and ATVV control frames verbatim.
+   *
+   * Diagnostic aid for a remote whose report layout is unknown: press the
+   * button that does nothing, then read the log. Returns { raw_report: bool }.
+   */
+  MiRC003.prototype.bleRawReport = function (on) {
+    return this.send(CMD.BLE_RAW_REPORT, [on === false ? 0 : 1]);
+  };
+
+  /**
+   * Select the HID report dialect: "auto", "rc003" or "google_tv".
+   *
+   * The two supported remotes multiplex different payloads onto the same
+   * characteristic and the bytes are ambiguous on their own, so "auto" decides
+   * from the advertised device name and this overrides it. Returns
+   * { layout: string }.
+   */
+  MiRC003.prototype.bleLayout = function (layout) {
+    var name = layout == null ? "auto" : String(layout);
+    var bytes = [];
+    for (var i = 0; i < name.length; i++) bytes.push(name.charCodeAt(i) & 0xFF);
+    return this.send(CMD.BLE_LAYOUT, bytes);
+  };
+
+  /**
+   * Read the user-defined name for each physical slot.
+   *
+   * Always returns exactly {@link MiRC003.KEY_SLOT_COUNT} strings in slot order;
+   * `""` means "no custom name, fall back to the built-in label". A firmware
+   * build without this opcode rejects, so callers that want to stay compatible
+   * with older devices must catch.
+   *
+   * @returns {Promise<string[]>}
+   */
+  MiRC003.prototype.keyNames = function () {
+    return this.send(CMD.KEY_NAMES_GET).then(function (res) {
+      return normalizeNames(res && res.names);
+    });
+  };
+
+  /**
+   * Rename one physical slot and persist it.
+   *
+   * `name` is truncated to {@link MiRC003.KEY_NAME_MAX_BYTES} UTF-8 bytes on a
+   * character boundary before it is sent; pass `""` to clear the custom name and
+   * go back to the built-in label.
+   *
+   * @param {number} slot Physical slot, `0` .. `KEY_SLOT_COUNT - 1`.
+   * @param {string} name New name (empty string restores the default).
+   * @returns {Promise<string[]>} the full name table after the write.
+   */
+  MiRC003.prototype.setKeyName = function (slot, name) {
+    // Validate the raw argument rather than a coerced number: Number(null) and
+    // Number("") are both 0, so coercing first would silently redirect a
+    // malformed call at slot 0 - a real write to the wrong button.
+    if (!Number.isInteger(slot) || slot < 0 || slot >= KEY_SLOT_COUNT) {
+      return Promise.reject(new Error("按键槽位超出范围（0-" + (KEY_SLOT_COUNT - 1) + "）"));
+    }
+    var text = truncateUtf8(name, KEY_NAME_MAX_BYTES);
+    return this.send(CMD.KEY_NAMES_SET, { slot: slot, name: text }).then(function (res) {
+      return normalizeNames(res && res.names);
+    });
+  };
+
   /** Recent device logs: { logs: string[] }. */
   MiRC003.prototype.getLogs = function () { return this.send(CMD.LOGS_GET); };
 
@@ -776,6 +934,11 @@
   MiRC003.ACTION = ACTION;
   MiRC003.GESTURES = GESTURES;
   MiRC003.PHYSICAL_KEYS = PHYSICAL_KEYS;
+  MiRC003.KEY_SLOT_COUNT = KEY_SLOT_COUNT;
+  MiRC003.DEFAULT_KEY_NAMES = DEFAULT_KEY_NAMES;
+  MiRC003.KEY_NAME_MAX_BYTES = KEY_NAME_MAX_BYTES;
+  /** See {@link truncateUtf8} - exposed so a UI can validate input as it is typed. */
+  MiRC003.truncateKeyName = function (str) { return truncateUtf8(str, KEY_NAME_MAX_BYTES); };
   MiRC003.SWITCH_MAP_DEFAULT = SWITCH_MAP_DEFAULT;
   MiRC003.SWITCH_MAP_LOCKED = SWITCH_MAP_LOCKED;
   MiRC003.MOD_BITS = MOD_BITS;

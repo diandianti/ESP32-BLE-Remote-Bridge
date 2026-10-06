@@ -3,7 +3,7 @@
 // ============================================================
 // Firmware identity
 // ============================================================
-#define FIRMWARE_NAME     "MI-RC003 Bridge"
+#define FIRMWARE_NAME     "ESP32 BLE Remote Bridge"
 #define FIRMWARE_VERSION  "1.3.3"
 #define FIRMWARE_BUILD    __DATE__ " " __TIME__
 #define HARDWARE_TARGET   "ESP32-S3"
@@ -14,7 +14,7 @@
 // The landing page advertised through the WebUSB BOS descriptor.
 // Scheme is defined by WEBUSB_LANDING_SCHEME (0 = http, 1 = https).
 // Keep this in sync with the static site in /webusb-config.
-#define WEBUSB_LANDING_URL     "ncmro7.github.io/MI-RC003-ESP32-Bridge/"
+#define WEBUSB_LANDING_URL     "diandianti.github.io/ESP32-BLE-Remote-Bridge/"
 #define WEBUSB_LANDING_SCHEME  1
 
 // Vendor request code advertised in the BOS descriptor (GET_URL).

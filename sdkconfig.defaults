@@ -42,6 +42,10 @@ CONFIG_BT_NIMBLE_HS_FLOW_CTRL_THRESH=2
 
 # ---- TinyUSB composite device --------------------------------------------
 CONFIG_TINYUSB_HID_COUNT=1
+# Left disabled on purpose: the composite device already provides WebUSB, and
+# the log is served through it. A TinyUSB CDC interface would additionally need
+# endpoint budget that the ESP32-S3 DWC2 does not have to spare alongside the
+# isochronous microphone endpoint.
 CONFIG_TINYUSB_CDC_ENABLED=n
 CONFIG_TINYUSB_VENDOR_COUNT=1
 CONFIG_TINYUSB_VENDOR_RX_BUFSIZE=4096
@@ -54,3 +58,12 @@ CONFIG_TINYUSB_RESUME_CALLBACK=y
 
 # ---- Logging --------------------------------------------------------------
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ---- Console --------------------------------------------------------------
+# The board's UART port is the ESP-IDF primary console and is the one wired to
+# a USB-UART bridge on this setup, so the log is read from there at 115200.
+#
+# The USB-Serial/JTAG secondary console is deliberately NOT enabled: with it on,
+# the UART output was observed to arrive as 0x00/0x3f framing garbage, and the
+# native USB port already carries the WebUSB log channel.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y

@@ -74,6 +74,10 @@
 | `BLE_UNPAIR` | `0x22` | 解除绑定 |
 | `BLE_INFO` | `0x23` | 已绑定信息 |
 | `BLE_RECONNECT` | `0x24` | 重新连接 |
+| `BLE_RAW_REPORT` | `0x25` | 逐条打印 HID 原始报文（调试用） |
+| `BLE_LAYOUT` | `0x26` | 指定 HID 报文方言（`auto` / `rc003` / `google_tv`） |
+| `KEY_NAMES_GET` | `0x27` | 读取 16 个物理槽位的自定义名称 |
+| `KEY_NAMES_SET` | `0x28` | 修改单个槽位的自定义名称 |
 | `NVS_RESET` | `0x31` | 恢复出厂（清空 NVS） |
 | `SYSTEM_RESTART` | `0x40` | 重启设备 |
 
@@ -174,6 +178,30 @@ MiRC003.ACTION[1]              // "键盘-单击"
 | 右列第 1 行 | 竖胶囊型上部中号圆形 | 音量+ | `0x80` |
 | 右列第 2 行 | 竖胶囊型下部中号圆形 | 音量- | `0x81` |
 | 右列第 3 行 | 中号圆形 | 电视键 | `0xc0` |
+
+### `MiRC003.KEY_SLOT_COUNT` / `MiRC003.DEFAULT_KEY_NAMES` / `MiRC003.KEY_NAME_MAX_BYTES`
+
+```js
+MiRC003.KEY_SLOT_COUNT      // 16 — 物理槽位数量（== PHYSICAL_KEYS.length）
+MiRC003.DEFAULT_KEY_NAMES   // ["电源键", "语音键 / 助手", ...] — 16 个出厂名称快照
+MiRC003.KEY_NAME_MAX_BYTES  // 31 — 自定义名称的 UTF-8 字节上限
+MiRC003.truncateKeyName(s)  // 按字符边界把 s 截断到 31 字节
+```
+
+**数组下标就是物理槽位号**，这一点是硬性约定，两个遥控器共用同一套槽位。但**不要再把数组下标
+当成遥控器上报的按钮索引**：索引只在**同一条 HID 报告内**唯一，Google TV Remote (ZTKA-IR57)
+有主 `0x0021`、副 `0x001D` 两条报告，各自从 1 开始编号（主报告索引 1 = 方向上，副报告索引 1 =
+音量+），因此扁平化的「索引 N → 槽位 N-1」恒等映射对这台遥控器不成立。固件改为按
+`(报告, 索引)` 查表得到规范键码（`MI_KEY_UP`、`MI_KEY_VOL_UP`…），再由键码定位到槽位并发出
+`PHYSICAL_KEYS[slot].vk`。所以**槽位与规范键码才是稳定身份**：显示名称与发出的动作都由用户决定，
+固件不再猜某个按钮「是什么键」，也不再假设索引与槽位有固定偏移。
+
+`DEFAULT_KEY_NAMES` 是**加载时的快照**，不会被自定义名称污染，可用于「恢复默认名称」。
+不要改用它去读 `PHYSICAL_KEYS[i].name` —— 界面会把用户名称写进那个字段。
+
+> `name` 是**字节**上限而不是字符数：一个汉字占 3 字节，因此最多约 10 个汉字。
+> 固件按裸字节截断（可能切断一个多字节字符），`setKeyName()` 会先在字符边界截断，
+> 保证界面显示的内容与设备保存的内容完全一致。
 
 ### `MiRC003.SWITCH_MAP_DEFAULT` — 默认配置切换映射
 
@@ -277,7 +305,7 @@ dev.send(cmd, payloadObj?, rawBytes?)
 | 方法 | 返回 |
 | :--- | :--- |
 | `deviceInfo()` | `Promise<{ name, version, build, hardware, protocol, capabilities[] }>` |
-| `status()` | `Promise<{ firmware, version, build, uptime_sec, ble_state, active_layer, battery, frames_decoded, samples_pushed, free_heap, free_psram, usb_mounted, switch_mode, config_rev }>` |
+| `status()` | `Promise<{ firmware, version, build, uptime_sec, ble_state, active_layer, battery, frames_decoded, samples_pushed, free_heap, free_psram, usb_mounted, switch_mode, config_rev, layout, reports_seen }>` |
 | `telemetry()` | `Promise<{ source_vk, is_pressed, pressed_vk, duration_ms, action_type, modifier, key_code, consumer_code, active_layer, switch_mode }>` |
 
 - `ble_state`：`0` 未连接 / `1` 扫描中 / `2` 连接中 / `3` 已连接 / `4` 语音中。
@@ -285,6 +313,8 @@ dev.send(cmd, payloadObj?, rawBytes?)
 - `telemetry().pressed_vk`：当前按下的物理键码，`0` 表示未按下。
 - `switch_mode`：配置切换模式是否激活。
 - `config_rev`：配置版本号，设备侧配置（层/绑定/切换映射）每次变更时递增；客户端可据此判断是否需要重新读取 keymap。
+- `layout`：当前生效的 HID 报文方言，`"rc003"` / `"google_tv"` / `"unknown"`。
+- `reports_seen`：开机以来解析过的 HID 通知条数。用于区分「遥控器根本没被听到」和「报文收到但没看懂」。
 
 ### 按键映射
 
@@ -297,6 +327,37 @@ dev.send(cmd, payloadObj?, rawBytes?)
 
 `Keymap` 结构见[第 5 节](#5-keymap-json-结构)。
 
+### 按键名称
+
+自定义名称按**物理槽位**存在设备 NVS 里，与按键映射相互独立：名称只影响显示，
+按键实际发出什么由 [按键映射](#按键映射) 决定。
+
+| 方法 | 返回 | 说明 |
+| :--- | :--- | :--- |
+| `keyNames()` | `Promise<string[]>` | 读取全部 16 个槽位的自定义名称 |
+| `setKeyName(slot, name)` | `Promise<string[]>` | 写入一个槽位，返回写入后的完整名称表 |
+
+```js
+const names = await dev.keyNames();     // 长度恒为 16，下标 = 槽位
+names[2];                               // "" 表示「未自定义，用出厂名称」
+
+await dev.setKeyName(2, "我的上键");     // 自定义
+await dev.setKeyName(2, "");            // 清空 -> 回到出厂名称
+```
+
+规则：
+
+- 返回值**恒为 16 个字符串**，下标即槽位；`""` 表示使用出厂名称。
+  `keyNames()` 对缺失 / 长度不足的响应做了归一化，因此老固件不会让页面抛异常。
+- `slot` 必须是 `0`~`15` 的整数，否则**本地 reject**（`按键槽位超出范围（0-15）`），
+  不会发出请求。校验作用于原始参数而非强制转换后的数字，
+  否则 `null` / `""` 会静默落到槽位 0 —— 那是一次写到错误按键的真实写入。
+- `name` 发送前按**字符边界**截断到 [`KEY_NAME_MAX_BYTES`](#mirc003key_slot_count--mirc003default_key_names--mirc003key_name_max_bytes) 字节。
+- 固件对越界槽位返回 `{"error":"bad_slot"}` 且 `status = 2`，此时 Promise reject。
+
+> 老固件没有 `0x27` / `0x28`，`keyNames()` / `setKeyName()` 会 reject。
+> 名称属于锦上添花的功能，调用方应当 try/catch 后回退出厂名称，而不是让整个连接流程失败。
+
 ### 蓝牙
 
 | 方法 | 参数 | 返回 |
@@ -306,6 +367,13 @@ dev.send(cmd, payloadObj?, rawBytes?)
 | `bleUnpair()` | — | `Promise<object>` |
 | `bleInfo()` | — | `Promise<{ connected, state, name, mac, bound_mac, bound_name, battery }>` |
 | `bleReconnect()` | — | `Promise<object>` |
+| `bleRawReport(on)` | `on` 缺省为 `true` | `Promise<{ raw_report: bool }>` |
+| `bleLayout(layout)` | `"auto"` / `"rc003"` / `"google_tv"` | `Promise<{ layout: string }>` |
+
+- `bleRawReport(true)`：把接下来若干条 HID 通知与 ATVV 控制帧原样打成十六进制日志。
+  用于弄不清某个按键上报什么时先打开它，再按那个键，然后到「运行日志」里看。
+- `bleLayout()`：两个遥控器把不同的负载复用在同一特征上，字节本身有歧义，因此固件默认
+  按广播名判断；此方法用于强制指定方言。
 
 ### 日志 / 系统
 
@@ -483,6 +551,14 @@ await dev.saveKeymap(km);
 - 厂商接口：USB class `0xFF`，BULK OUT / BULK IN 端点由浏览器自动识别。
 - 大负载（如保存按键）建议分块发送（库已用 `KEYMAP_BEGIN/DATA/COMMIT` 实现）。
 
+`payload` 是 UTF-8 的 JSON（`KEYMAP_DATA` 为裸字节）。按键名称两个命令的负载：
+
+| 命令 | 请求 payload | 成功响应 payload |
+| :--- | :--- | :--- |
+| `KEY_NAMES_GET` `0x27` | 空 | `{"names":["","",...]}` —— 恒为 16 项，下标 = 槽位 |
+| `KEY_NAMES_SET` `0x28` | `{"slot":0,"name":"电源"}` | 同 GET 的完整名称表 |
+| `KEY_NAMES_SET`（槽位越界） | `{"slot":99,"name":"x"}` | `{"error":"bad_slot"}`，`status = 2` |
+
 ---
 
 ## 7. 错误处理
@@ -508,6 +584,7 @@ try {
 | 未连接时调用 | `设备未连接` |
 | 浏览器不支持 | `当前浏览器不支持 WebUSB` |
 | 未找到厂商接口 | `未找到 WebUSB 厂商接口` |
+| `setKeyName()` 槽位越界 | `按键槽位超出范围（0-15）`（本地 reject，不发请求） |
 
 ---
 
@@ -538,3 +615,12 @@ try {
 | `MiRC003.STATUS` | 同文件的 `WEBUSB_*` |
 | `MiRC003.ACTIONS` | `main/keymap/key_state_machine.h` 的 `ACTION_*` |
 | 遥测字段 | `key_telemetry_to_json()`（`main/keymap/key_config_storage.cpp`） |
+| `MiRC003.PHYSICAL_KEYS` / `KEY_SLOT_COUNT` / `DEFAULT_KEY_NAMES` | 固件的规范化键码表与槽位顺序：**数组下标必须等于物理槽位号**，两个 Google TV 索引表都按它取值 |
+| `MiRC003.KEY_NAME_MAX_BYTES` | 固件 `KEY_NAMES_SET` 的 31 字节上限 |
+
+> `PHYSICAL_KEYS` 的顺序**不是**遥控器的物理布局，而是槽位编号：它由固件的规范化键码表与槽位顺序
+> 决定，**不是**遥控器上报索引的偏移结果 —— 索引只在单条 HID 报告内唯一，双报告遥控器上会重号
+> （见上一节）。型号不同、按键与索引的对应不同的遥控器，出厂名称可能对不上实物 ——
+> 这是预期行为，正确做法是在「按键学习」里给槽位改名，而不是调整这个数组的顺序。
+> 需要核对原始索引时，到「运行日志」页打开 `raw report`，看固件日志
+> `HOGP: button chr#N idx=M -> key 0xXX (name) DOWN`。

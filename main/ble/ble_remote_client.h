@@ -45,6 +45,27 @@ size_t ble_remote_get_connected_info(char *out, size_t out_len);
 /** @brief Remote battery level in percent (0-100), or -1 if unknown. */
 int ble_remote_get_battery(void);
 
+/**
+ * @brief Log the next few HID notifications verbatim.
+ *
+ * Diagnostic aid for a remote whose report format is unknown: the raw bytes
+ * are printed as hex so a new layout can be decoded from the device log.
+ */
+void ble_remote_set_raw_report_log(bool on);
+
+/**
+ * @brief Force the HID report dialect instead of detecting it from the name.
+ *
+ * @param layout  "auto", "rc003"/"xiaomi", or "google_tv"/"google".
+ */
+void ble_remote_set_layout_override(const char *layout);
+
+/** @brief Active report dialect: "rc003", "google_tv" or "unknown". */
+const char *ble_remote_layout_name(void);
+
+/** @brief HID notifications parsed since boot (diagnostic). */
+uint32_t ble_remote_reports_seen(void);
+
 #ifdef __cplusplus
 }
 #endif

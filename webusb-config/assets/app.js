@@ -10,7 +10,7 @@
   "use strict";
 
   // WebUI version (independent of the firmware version). Bump on UI changes.
-  const WEBUI_VERSION = "1.5";
+  const WEBUI_VERSION = "1.7";
 
   const dev = new MiRC003();
   const ACTION = MiRC003.ACTION;
@@ -23,6 +23,14 @@
   const HID_EXTRA_GROUPS = MiRC003.HID_EXTRA_GROUPS;
   const CONSUMER_GROUPS = MiRC003.CONSUMER_GROUPS;
   const Keymap = MiRC003.Keymap;
+
+  // Physical-slot constants. The fallbacks keep the page usable against a cached
+  // older mi-rc003.js; PHYSICAL_KEYS.map() is still a valid snapshot of the
+  // built-in labels because nothing has renamed a slot yet at load time.
+  const KEY_SLOT_COUNT = MiRC003.KEY_SLOT_COUNT || PHYSICAL_KEYS.length;
+  const DEFAULT_KEY_NAMES = MiRC003.DEFAULT_KEY_NAMES || PHYSICAL_KEYS.map((k) => k.name);
+  const KEY_NAME_MAX_BYTES = MiRC003.KEY_NAME_MAX_BYTES || 31;
+  const truncateKeyName = MiRC003.truncateKeyName || ((s) => String(s == null ? "" : s));
 
   const ICON = {
     power: '<svg viewBox="0 0 24 24"><path d="M12 3v9M7.05 5.93a8 8 0 1 0 9.9 0"/></svg>',
@@ -48,6 +56,14 @@
   let savingKeymap = false;
   let lastConfigRev = null;     // device config revision seen by the UI
 
+  // Custom per-slot display names, index = physical slot, "" = use the built-in
+  // label. Mirrors the firmware's KEY_NAMES table exactly.
+  let keyNames = new Array(KEY_SLOT_COUNT).fill("");
+  let namesState = "unknown";   // "unknown" | "ok" | "unsupported" (old firmware)
+  let learnPressActive = false; // rising-edge detector for the 150 ms poll
+  let learnArmedSlot = -1;      // row waiting for its button to be pressed
+  let learnHistory = [];        // recently pressed slots, oldest first
+
   const $ = (id) => document.getElementById(id);
 
   /* ------------------------- helpers ------------------------- */
@@ -57,6 +73,12 @@
     $("conn-text").textContent = on ? "已连接" : "未连接";
     $("btn-connect").disabled = on;
     $("btn-disconnect").disabled = !on;
+    if (!on) {
+      // Renaming is device-backed, so the controls must stop claiming to work
+      // once the device is gone.
+      namesState = "unknown";
+      renderLearnNamesState();
+    }
   }
 
   function formatUptime(sec) {
@@ -97,6 +119,7 @@
       setConnected(true);
       toast("设备已连接");
       await loadDeviceInfo();
+      await loadKeyNames();
       await refreshStatus();
       await loadKeymap();
       await refreshBleInfo();
@@ -164,6 +187,15 @@
   async function refreshTelemetry() {
     try {
       const t = await dev.telemetry();
+
+      // The learn tab always follows the poll: it is the one place where a
+      // missed press means the user cannot identify a button at all.
+      updateLearnDetector(t);
+
+      // The status panel keeps honouring its own "实时刷新" switch.
+      const liveToggle = $("telemetry-live");
+      if (liveToggle && !liveToggle.checked) return;
+
       const pk = PHYSICAL_KEYS.find((k) => k.vk === t.pressed_vk);
       const nameEl = $("live-key-name");
       nameEl.textContent = pk ? pk.name : "—";
@@ -501,9 +533,330 @@
       volume,
       round(0x24, "round home", ICON.home),
       round(0x5d, "round menu", ICON.menu),
-      round(0xc0, "round tv", "<span>TV</span>")
+      round(0xc0, "round tv", "<span>IN</span>")
     );
     host.appendChild(controls);
+
+    // Mute and the preset-app buttons. Only some Google TV Remote variants
+    // carry these, so they are rendered as a separate labelled strip rather
+    // than being folded into the 13-key body: on a remote without them the
+    // strip is simply never pressed, and the mappings stay available for a
+    // different unit.
+    const extras = document.createElement("div");
+    extras.className = "remote-extras";
+    ["静音", "App1", "App2"].forEach((label, i) => {
+      const vk = [0x7d, 0x7e, 0x7f][i];
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "extra";
+      btn.innerHTML = `<span>${label}</span>`;
+      extras.appendChild(bindBtn(btn, layer, vk));
+    });
+    host.appendChild(extras);
+  }
+
+  /* ------------------------- key names / learn ------------------------- */
+
+  // Display names live on the device (NVS), keyed by physical slot. The
+  // firmware treats the Google TV Remote's button index as an identity, so a
+  // slot is the only stable handle a button has: rename the slot, remap the
+  // slot, and nothing in the firmware has to guess what the button means.
+
+  /** Push `keyNames` into the live PHYSICAL_KEYS table every view reads from. */
+  function applyKeyNames() {
+    for (let i = 0; i < KEY_SLOT_COUNT; i++) {
+      if (PHYSICAL_KEYS[i]) PHYSICAL_KEYS[i].name = keyNames[i] || DEFAULT_KEY_NAMES[i];
+    }
+  }
+
+  async function loadKeyNames() {
+    try {
+      keyNames = await dev.keyNames();
+      namesState = "ok";
+    } catch (e) {
+      // A firmware without KEY_NAMES_GET/0x27 rejects here. Names are cosmetic,
+      // so fall back to the built-ins and disable editing rather than letting
+      // this break the whole connect sequence.
+      console.warn("读取按键名称失败（固件可能不支持）:", e.message);
+      keyNames = new Array(KEY_SLOT_COUNT).fill("");
+      namesState = "unsupported";
+    }
+    applyKeyNames();
+    renderLearnNamesState();
+    renderLearnTable();
+    // Every surface that prints a key name has to be repainted.
+    renderKeymapGrid();
+    const infoEl = $("remote-info");
+    if (infoEl) infoEl.textContent = "将鼠标移到按键上查看映射";
+    if (dev.isConnected()) refreshTelemetry();
+  }
+
+  function renderLearnNamesState() {
+    const saveBtn = $("btn-learn-save");
+    const resetBtn = $("btn-learn-reset");
+    const editable = namesState === "ok";
+    if (saveBtn) saveBtn.disabled = !editable;
+    if (resetBtn) resetBtn.disabled = !editable;
+
+    const note = $("learn-names-note");
+    if (!note) return;
+    if (namesState === "unsupported") {
+      note.classList.remove("hidden");
+      note.innerHTML = "当前固件<b>不支持自定义名称</b>（没有 KEY_NAMES_GET / 0x27 命令），" +
+        "下面的改名与保存已停用；「实时检测」和「检测 / 去映射」不受影响。" +
+        "需要改名请先到顶部「固件烧录」更新固件。";
+    } else if (namesState === "unknown") {
+      note.classList.remove("hidden");
+      note.textContent = "连接设备后可读取 / 保存自定义名称。";
+    } else {
+      note.classList.add("hidden");
+      note.textContent = "";
+    }
+  }
+
+  function updateNameCounter(input) {
+    const el = $("learn-count-" + input.dataset.slot);
+    if (!el) return;
+    const raw = input.value;
+    const bytes = new TextEncoder().encode(raw).length;
+    const trimmed = truncateKeyName(raw);
+    const over = trimmed !== raw;
+    el.textContent = bytes + " / " + KEY_NAME_MAX_BYTES + " 字节";
+    el.classList.toggle("over", over);
+    el.title = over ? "超长，保存时会被截断为：" + trimmed : "";
+  }
+
+  function renderLearnTable() {
+    const tbody = $("learn-rows");
+    if (!tbody) return;
+    tbody.innerHTML = "";
+    for (let slot = 0; slot < KEY_SLOT_COUNT; slot++) {
+      if (!PHYSICAL_KEYS[slot]) continue;
+      const tr = document.createElement("tr");
+      tr.id = "learn-row-" + slot;
+      tr.dataset.slot = String(slot);
+
+      const tdSlot = document.createElement("td");
+      tdSlot.className = "learn-slot-cell";
+      tdSlot.innerHTML = `<b>${slot}</b>`;
+
+      const tdDefault = document.createElement("td");
+      tdDefault.className = "learn-default";
+      tdDefault.textContent = DEFAULT_KEY_NAMES[slot] || "—";
+
+      const tdName = document.createElement("td");
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "learn-name";
+      input.id = "learn-name-" + slot;
+      input.dataset.slot = String(slot);
+      input.value = keyNames[slot] || "";
+      input.placeholder = DEFAULT_KEY_NAMES[slot] || "默认名称";
+      input.autocomplete = "off";
+      input.addEventListener("input", () => updateNameCounter(input));
+      const counter = document.createElement("span");
+      counter.className = "name-counter";
+      counter.id = "learn-count-" + slot;
+      tdName.append(input, counter);
+
+      const tdAct = document.createElement("td");
+      tdAct.className = "learn-actions";
+      const armBtn = document.createElement("button");
+      armBtn.type = "button";
+      armBtn.className = "btn small";
+      armBtn.textContent = "检测";
+      armBtn.title = "点这里，然后按遥控器上的键：这一行会闪烁表示匹配";
+      armBtn.onclick = () => armLearnSlot(slot);
+      const mapBtn = document.createElement("button");
+      mapBtn.type = "button";
+      mapBtn.className = "btn small";
+      mapBtn.textContent = "去映射";
+      mapBtn.title = "到「按键配置」里修改这个槽位发出的按键";
+      mapBtn.onclick = () => gotoKeymapForSlot(slot);
+      tdAct.append(armBtn, mapBtn);
+
+      tr.append(tdSlot, tdDefault, tdName, tdAct);
+      tbody.appendChild(tr);
+      updateNameCounter(input);
+    }
+  }
+
+  function renderLearnHistory() {
+    const host = $("learn-history");
+    if (!host) return;
+    if (!learnHistory.length) {
+      host.innerHTML = '<span class="learn-empty">暂无</span>';
+      return;
+    }
+    host.innerHTML = learnHistory.map((slot, i) => {
+      const pk = PHYSICAL_KEYS[slot];
+      const latest = i === learnHistory.length - 1 ? " latest" : "";
+      return `<span class="learn-chip${latest}"><b>${slot}</b>${escapeHtml(pk ? pk.name : "?")}</span>`;
+    }).join("");
+  }
+
+  /** Slot for a canonical key code, or -1 when the code is not in the table. */
+  function slotOfVk(vk) {
+    if (!vk) return -1;
+    return PHYSICAL_KEYS.findIndex((k) => k.vk === vk);
+  }
+
+  function armLearnSlot(slot) {
+    learnArmedSlot = slot;
+    const tip = $("learn-tip");
+    if (tip) {
+      tip.innerHTML = `正在等待<b>槽位 ${slot}</b>：请按下遥控器上你认为对应这个槽位的按键。`;
+    }
+    document.querySelectorAll("#learn-rows tr").forEach((tr) => {
+      tr.classList.remove("hit");
+      tr.classList.toggle("armed", Number(tr.dataset.slot) === slot);
+    });
+    const row = $("learn-row-" + slot);
+    if (row && row.scrollIntoView) row.scrollIntoView({ block: "nearest" });
+  }
+
+  /**
+   * Jump to the keymap tab and open the existing per-key editor for a slot.
+   *
+   * Deliberately reuses `openEditor` (the same function the on-screen remote
+   * buttons call) so there is exactly one editor implementation: this only
+   * switches the tab and hands over the PHYSICAL_KEYS entry.
+   */
+  function gotoKeymapForSlot(slot) {
+    const pk = PHYSICAL_KEYS[slot];
+    if (!pk) return;
+    if (!keymap) { toast("请先连接设备并读取按键配置", true); return; }
+    const tab = document.querySelector('.tab[data-tab="keymap"]');
+    if (tab) tab.click();
+    openEditor(pk);
+  }
+
+  /** Live detector: mirrors the newest telemetry sample onto the learn panel. */
+  function updateLearnDetector(t) {
+    const readout = $("learn-readout");
+    if (!readout) return;
+    const slot = slotOfVk(t.pressed_vk);
+    const pressed = !!t.pressed_vk;
+
+    readout.classList.toggle("active", slot >= 0);
+    readout.classList.toggle("unknown", pressed && slot < 0);
+    if (slot >= 0) {
+      $("learn-state").textContent = "检测到按键";
+      $("learn-name").textContent = PHYSICAL_KEYS[slot].name;
+      $("learn-slot").textContent = `槽位 ${slot}`;
+      $("learn-slot-idx").textContent = String(slot);
+    } else if (pressed) {
+      $("learn-state").textContent = "未识别的键码";
+      $("learn-name").textContent = "0x" + Number(t.pressed_vk).toString(16).toUpperCase();
+      $("learn-slot").textContent = "不在按键表内";
+      $("learn-slot-idx").textContent = "-";
+    } else {
+      $("learn-state").textContent = "等待按键";
+      $("learn-name").textContent = "—";
+      $("learn-slot").textContent = "槽位 —";
+      $("learn-slot-idx").textContent = "-";
+    }
+    $("learn-vk").textContent = pressed
+      ? "0x" + Number(t.pressed_vk).toString(16).toUpperCase().padStart(2, "0")
+      : "-";
+    $("learn-duration").textContent = (t.duration_ms || 0) + " ms";
+
+    document.querySelectorAll("#learn-rows tr").forEach((tr) => {
+      tr.classList.toggle("pressed", slot >= 0 && Number(tr.dataset.slot) === slot);
+    });
+
+    // Rising edge only: the remote repeats its report while a button is held,
+    // and the poll would otherwise record the same press several times.
+    if (!pressed) { learnPressActive = false; return; }
+    if (learnPressActive) return;
+    learnPressActive = true;
+    if (slot < 0) return;
+
+    if (learnArmedSlot === slot) {
+      learnArmedSlot = -1;
+      // Drop the amber "waiting" state everywhere: leaving it on the row that
+      // just matched would keep claiming it is still waiting for a press.
+      document.querySelectorAll("#learn-rows tr").forEach((tr) => tr.classList.remove("armed"));
+      const row = $("learn-row-" + slot);
+      if (row) {
+        row.classList.add("hit");
+        if (row.scrollIntoView) row.scrollIntoView({ block: "nearest" });
+      }
+      const tip = $("learn-tip");
+      if (tip) {
+        tip.innerHTML = `已确认：<b>${escapeHtml(PHYSICAL_KEYS[slot].name)}</b> 就是槽位 ${slot}。` +
+          `改好名字后点「保存名称」。`;
+      }
+    }
+
+    learnHistory.push(slot);
+    if (learnHistory.length > 8) learnHistory.shift();
+    renderLearnHistory();
+  }
+
+  function resetLearnDetector() {
+    learnPressActive = false;
+    learnArmedSlot = -1;
+    const readout = $("learn-readout");
+    if (readout) {
+      readout.classList.remove("active", "unknown");
+      $("learn-state").textContent = "等待按键";
+      $("learn-name").textContent = "—";
+      $("learn-slot").textContent = "槽位 —";
+      $("learn-slot-idx").textContent = "-";
+      $("learn-vk").textContent = "-";
+      $("learn-duration").textContent = "-";
+    }
+    document.querySelectorAll("#learn-rows tr").forEach((tr) => {
+      tr.classList.remove("pressed", "armed", "hit");
+    });
+  }
+
+  async function saveLearnNames() {
+    if (!dev.isConnected()) { toast("请先连接设备", true); return; }
+    if (namesState !== "ok") { toast("当前固件不支持自定义名称", true); return; }
+
+    const pending = [];
+    document.querySelectorAll("#learn-rows input.learn-name").forEach((input) => {
+      const slot = Number(input.dataset.slot);
+      const value = input.value.trim();
+      if (value !== (keyNames[slot] || "")) pending.push({ slot: slot, name: value });
+    });
+    if (!pending.length) { toast("没有需要保存的修改"); return; }
+
+    const btn = $("btn-learn-save");
+    const oldText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "保存中...";
+    try {
+      for (const item of pending) {
+        // Sequential: one bad slot should stop the run, not be skipped silently.
+        // Every response carries the authoritative table, so the last one wins.
+        keyNames = await dev.setKeyName(item.slot, item.name);
+      }
+      applyKeyNames();
+      renderLearnTable();
+      renderKeymapGrid();
+      if (dev.isConnected()) refreshTelemetry();
+      toast("已保存 " + pending.length + " 个名称");
+    } catch (e) {
+      console.error(e);
+      toast("保存名称失败: " + e.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = oldText;
+    }
+  }
+
+  async function resetLearnNames() {
+    if (!dev.isConnected()) { toast("请先连接设备", true); return; }
+    if (namesState !== "ok") { toast("当前固件不支持自定义名称", true); return; }
+    if (!confirm("清除全部自定义名称，恢复默认？")) return;
+    document.querySelectorAll("#learn-rows input.learn-name").forEach((input) => {
+      input.value = "";
+      updateNameCounter(input);
+    });
+    await saveLearnNames();
   }
 
   /* ------------------------- switch map ------------------------- */
@@ -1168,7 +1521,11 @@
       if ($("log-auto").checked) refreshLogs();
     }, 3000);
     telemetryTimer = setInterval(() => {
-      if ($("telemetry-live").checked) refreshTelemetry();
+      // One poll drives both the status card and the learn detector; it stays on
+      // while either tab's own "实时刷新 / 实时监听" switch asks for it.
+      const statusLive = $("telemetry-live");
+      const learnLive = $("learn-live");
+      if ((statusLive && statusLive.checked) || (learnLive && learnLive.checked)) refreshTelemetry();
     }, 150);
   }
   function stopAutoRefresh() {
@@ -1179,6 +1536,7 @@
     const nameEl = $("live-key-name");
     if (nameEl) { nameEl.textContent = "—"; nameEl.classList.remove("active"); }
     document.querySelectorAll(".remote .pressed").forEach((el) => el.classList.remove("pressed"));
+    resetLearnDetector();
   }
 
   /* ------------------------- wiring ------------------------- */
@@ -1252,6 +1610,13 @@
       if (!confirm("确定恢复出厂设置？将清除所有配置与绑定。")) return;
       try { await dev.factoryReset(); toast("已恢复出厂，设备重启中..."); } catch (e) { toast(e.message, true); }
     };
+    // ---- 按键学习 ----
+    if ($("btn-learn-save")) $("btn-learn-save").onclick = saveLearnNames;
+    if ($("btn-learn-reset")) $("btn-learn-reset").onclick = resetLearnNames;
+    if ($("btn-learn-clear")) {
+      $("btn-learn-clear").onclick = () => { learnHistory = []; renderLearnHistory(); };
+    }
+
     $("btn-json-load").onclick = () => loadKeymap();
     $("btn-json-apply").onclick = async () => {
       try {
@@ -1306,6 +1671,12 @@
       renderSwitchMap();
       toast("已修改，点击「保存到设备」生效");
     };
+
+    // Paint the learn tab before any device is attached so it is never blank
+    // and the "how to use" flow is readable offline.
+    renderLearnTable();
+    renderLearnHistory();
+    renderLearnNamesState();
 
     setConnected(false);
   }

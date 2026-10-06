@@ -1,8 +1,10 @@
 #include "ble_remote_client.h"
 #include "app_config.h"
 #include "app_log.h"
+#include "audio/atvv_audio.h"
 #include "audio/audio_pipeline.h"
 #include "keymap/key_state_machine.h"
+#include "keymap/key_names.h"
 #include "led/led_indicator.h"
 #include "storage/config_store.h"
 #include "usb/hid_bridge.h"
@@ -83,7 +85,13 @@ static uint16_t s_hid_start = 0, s_hid_end = 0;
 static size_t s_frame_size = AUDIO_DEFAULT_FRAME_BYTES;
 static uint8_t s_session_id = 0;
 static uint32_t s_conn_start_ms = 0;
+static uint32_t s_talking_start_ms = 0;
 static bool s_discovery_started = false;
+
+// The remote closes the microphone itself (AUDIO_STOP) in the normal case.
+// This is only a backstop so a lost notification cannot leave the remote
+// encoding forever: the specification's own session timer is 7 seconds.
+#define VOICE_SESSION_MAX_MS 10000
 
 // Bound remote (persisted in NVS)
 static char    s_bound_mac[18] = {0};
@@ -170,7 +178,19 @@ static int write_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
 {
     (void)conn_handle; (void)attr; (void)arg;
     if (error->status != 0) {
-        app_log("BLE", "GATT write handle 0x%04X failed: %d", s_ops[s_op_idx].handle, error->status);
+        // 0x100 | BLE_HS_ENOTSUP is what NimBLE reports for a Write Without
+        // Response once the value has been handed to the controller: there is
+        // no ATT response by definition, so the local completion status is
+        // "not supported" rather than an error from the peer. Treating it as a
+        // failure is misleading - the writes to the ATVV command
+        // characteristic, which is exactly this kind of write, demonstrably
+        // reach the remote (pressing the voice button makes it stream audio).
+        uint8_t host_status = (uint8_t)(error->status & 0xFF);
+        if (error->status == (int)(0x100 | 8) || host_status == 8) {
+            app_log("BLE", "write 0x%04X sent without response", s_ops[s_op_idx].handle);
+        } else {
+            app_log("BLE", "GATT write handle 0x%04X failed: %d", s_ops[s_op_idx].handle, error->status);
+        }
     }
     s_op_idx++;
     run_next_op();
@@ -224,7 +244,12 @@ static void run_next_op(void)
             s_op_count = 0;
             s_op_idx = 0;
             if (s_atvv_cmd_chr) {
-                static const uint8_t caps[6] = { 0x0A, 0x01, 0x00, 0x00, 0x03, 0x03 };
+                // ATVV GET_CAPS: opcode 0x0A followed by version(2) and
+                // codecs_supported(2). Version 0.4 is the revision this
+                // firmware implements; advertising codec 0x0007 (Opus plus
+                // ADPCM at 8 and 16 kHz) lets every remote pick a codec it
+                // actually has, and the reply tells us which one it chose.
+                static const uint8_t caps[5] = { 0x0A, 0x00, 0x04, 0x00, 0x07 };
                 s_ops[s_op_count].handle = s_atvv_cmd_chr;
                 memcpy(s_ops[s_op_count].data, caps, sizeof(caps));
                 s_ops[s_op_count].len = sizeof(caps);
@@ -440,6 +465,19 @@ static void start_discovery(void)
 // ===========================================================================
 // Notification handling
 // ===========================================================================
+// Defined further down with the other ATVV helpers.
+static void atvv_audio_note_frame(uint16_t len);
+static void atvv_audio_reset_stats(void);
+static void atvv_audio_log_stats(void);
+static void atvv_send_mic_open(void);
+static void atvv_send_mic_close(void);
+// Arms the raw-audio hex trace; defined with the dump state further down.
+static void atvv_audio_arm_dump(void);
+
+// Set by ble_remote_set_raw_report_log(); declared here because the ATVV
+// control handler and the HID handlers both consult it.
+static bool s_raw_report_log;
+
 static void handle_atvv_ctl(const uint8_t *data, size_t len)
 {
     if (len < 1) return;
@@ -449,11 +487,19 @@ static void handle_atvv_ctl(const uint8_t *data, size_t len)
         s_session_id = (len >= 4) ? data[3] : 0;
         uint8_t codec = (len >= 3) ? data[2] : 0;
         s_state = BLE_STATE_TALKING;
+        s_talking_start_ms = now_ms();
+        atvv_audio_reset_stats();
+        atvv_audio_begin_session();
+        atvv_audio_arm_dump();
         key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, true, now_ms());
         app_log("ATVV", "Voice start (session %u, codec %u)", s_session_id, codec);
     } else if (op == 0x00 || op == 0x08) {
         if (s_state == BLE_STATE_TALKING) {
             s_state = BLE_STATE_CONNECTED;
+            atvv_audio_log_stats();
+            // Tell the remote to stop encoding, otherwise it keeps the
+            // microphone running until its own timeout expires.
+            atvv_send_mic_close();
             key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, false, now_ms());
             app_log("ATVV", "Voice stop");
         }
@@ -462,7 +508,16 @@ static void handle_atvv_ctl(const uint8_t *data, size_t len)
         uint8_t codecs = (len >= 4) ? data[3] : 0;
         uint16_t fs = (uint16_t)((data[5] << 8) | data[6]);
         if (fs > 0) s_frame_size = fs;
-        app_log("ATVV", "Capabilities: ver=0x%04X codecs=0x%02X frame=%u", ver, codecs, (unsigned)s_frame_size);
+        app_log("ATVV", "Capabilities: ver=0x%04X codecs=0x%02X frame=%u",
+                ver, codecs, (unsigned)s_frame_size);
+        if (s_raw_report_log && len <= 16) {
+            char hex[3 * 16 + 1];
+            for (size_t i = 0; i < len; i++) {
+                snprintf(&hex[i * 3], 4, "%02X ", data[i]);
+            }
+            hex[len * 3] = '\0';
+            app_log("ATVV", "caps raw [%s]", hex);
+        }
     } else if (op == 0x0A && len >= 7) {
         int16_t pred = (int16_t)((data[4] << 8) | data[5]);
         int8_t step = (int8_t)data[6];
@@ -470,32 +525,495 @@ static void handle_atvv_ctl(const uint8_t *data, size_t len)
     }
 }
 
-static void handle_hid_report(const uint8_t *data, size_t len)
+// ATVV MIC_OPEN: opcode 0x0C followed by a 2-byte codec_used field
+// (0x0001 = ADPCM 8 kHz/16-bit, 0x0002 = ADPCM 16 kHz/16-bit). Without the
+// codec field a conforming remote cannot tell which stream to produce.
+//
+// The requested codec has to match what the rest of the firmware is built for.
+// It used to ask for 16 kHz unconditionally while AUDIO_SAMPLE_RATE - and with
+// it the decoder's expectations, the UAC descriptor and the isochronous packet
+// size - were all 8 kHz. This remote happens to ignore the request and send
+// codec 1 anyway, so nothing broke; a remote that honoured it would have been
+// decoded and played back at half speed. Deriving it removes that trap.
+#if AUDIO_SAMPLE_RATE >= 16000
+#define ATVV_MIC_CODEC 0x0002u
+#define ATVV_MIC_CODEC_NAME "ADPCM 16 kHz"
+#else
+#define ATVV_MIC_CODEC 0x0001u
+#define ATVV_MIC_CODEC_NAME "ADPCM 8 kHz"
+#endif
+
+static void atvv_send_mic_open(void)
+{
+    if (!s_atvv_cmd_chr || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    static const uint8_t cmd[3] = {
+        0x0C, (uint8_t)(ATVV_MIC_CODEC & 0xFF), (uint8_t)(ATVV_MIC_CODEC >> 8)
+    };
+    int rc = ble_gattc_write_flat(s_conn_handle, s_atvv_cmd_chr, cmd, sizeof(cmd), NULL, NULL);
+    app_log("ATVV", "MIC_OPEN (codec 0x%04X = %s) rc=%d",
+            (unsigned)ATVV_MIC_CODEC, ATVV_MIC_CODEC_NAME, rc);
+}
+
+// ATVV MIC_CLOSE: opcode 0x0D, no payload.
+static void atvv_send_mic_close(void)
+{
+    if (!s_atvv_cmd_chr || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    static const uint8_t cmd[1] = { 0x0D };
+    int rc = ble_gattc_write_flat(s_conn_handle, s_atvv_cmd_chr, cmd, sizeof(cmd), NULL, NULL);
+    app_log("ATVV", "MIC_CLOSE rc=%d", rc);
+}
+
+// ===========================================================================
+// Remote layout
+//
+// The two supported remotes multiplex different things onto the same HID
+// report characteristic, and their payloads are genuinely ambiguous: the
+// Xiaomi RC003 packs 16-bit little-endian HID usages, while the Google TV
+// Remote sends a one-byte button index, so a two-byte RC003 report `01 00`
+// and a Google index report `[01]` are indistinguishable from the bytes
+// alone. The layout is therefore decided once per connection from the
+// advertised name, with a manual override for anything unusual.
+// ===========================================================================
+typedef enum {
+    REMOTE_LAYOUT_UNKNOWN = 0,
+    REMOTE_LAYOUT_RC003,
+    REMOTE_LAYOUT_GOOGLE_TV,
+} remote_layout_t;
+
+// Counts every HID notification that reaches the parser, so "the remote is not
+// being heard at all" is distinguishable from "the report was not understood".
+static uint32_t s_reports_seen_total = 0;
+
+// Counts only the notifications that carried a non-zero key slot, which is what
+// the unconditional trace and the button table are keyed off.
+static uint32_t s_reports_press_total = 0;
+
+// Bounds the per-notification trace in the GAP handler.
+static uint32_t s_notify_trace = 0;
+
+// Per-path call counters. These make it unambiguous whether a report reached
+// the Google index parser or was handed to the RC003 decoder, which is the one
+// thing the aggregate counter cannot show.
+static uint32_t s_gtv_calls = 0;
+static uint32_t s_rc003_calls = 0;
+static uint32_t s_release_calls = 0;
+
+// State for the periodic health line printed by ble_remote_task().
+static uint32_t s_health_last_ms = 0;
+static uint32_t s_health_last_reports = 0;
+
+static remote_layout_t s_layout = REMOTE_LAYOUT_UNKNOWN;
+static remote_layout_t s_layout_override = REMOTE_LAYOUT_UNKNOWN;
+
+const char *ble_remote_layout_name(void)
+{
+    switch (s_layout) {
+        case REMOTE_LAYOUT_RC003:     return "rc003";
+        case REMOTE_LAYOUT_GOOGLE_TV: return "google_tv";
+        default:                      return "unknown";
+    }
+}
+
+uint32_t ble_remote_reports_seen(void)
+{
+    return s_reports_seen_total;
+}
+void ble_remote_set_layout_override(const char *layout)
+{
+    if (!layout || !layout[0] || strcasecmp(layout, "auto") == 0) {
+        s_layout_override = REMOTE_LAYOUT_UNKNOWN;
+    } else if (strcasecmp(layout, "google_tv") == 0 || strcasecmp(layout, "google") == 0) {
+        s_layout_override = REMOTE_LAYOUT_GOOGLE_TV;
+    } else if (strcasecmp(layout, "rc003") == 0 || strcasecmp(layout, "xiaomi") == 0) {
+        s_layout_override = REMOTE_LAYOUT_RC003;
+    } else {
+        s_layout_override = REMOTE_LAYOUT_UNKNOWN;
+    }
+    app_log("BLE", "Remote layout override: %s", layout && layout[0] ? layout : "auto");
+}
+
+static bool name_contains(const char *name, const char *needle)
+{
+    return name && needle && strstr(name, needle) != NULL;
+}
+
+static remote_layout_t detect_layout(const char *name)
+{
+    if (!name || !name[0]) return REMOTE_LAYOUT_UNKNOWN;
+    // Google's remote advertises as "Google TV Remote"; match on the brand
+    // only, so regional suffixes do not change the decision.
+    if (name_contains(name, "Google") || name_contains(name, "google")) {
+        return REMOTE_LAYOUT_GOOGLE_TV;
+    }
+    if (name_contains(name, "MI RC") || name_contains(name, "Xiaomi") ||
+        name_contains(name, "xiaomi") || name_contains(name, "小米") ||
+        name_contains(name, "遥控")) {
+        return REMOTE_LAYOUT_RC003;
+    }
+    return REMOTE_LAYOUT_UNKNOWN;
+}
+
+// Choose the parser for this connection. Returns true when the layout changed.
+static bool apply_layout_for_connection(const char *name)
+{
+    remote_layout_t want = s_layout_override;
+    if (want == REMOTE_LAYOUT_UNKNOWN) {
+        want = detect_layout(name);
+    }
+    if (want == REMOTE_LAYOUT_UNKNOWN) {
+        // Fall back to the RC003 interpretation, which is what the firmware
+        // has always done; the raw-report log will show if that was wrong.
+        want = REMOTE_LAYOUT_RC003;
+    }
+    app_log("BLE", "Remote \"%s\" -> layout %s", name && name[0] ? name : "?",
+            want == REMOTE_LAYOUT_GOOGLE_TV ? "google_tv" : "rc003");
+    bool changed = (want != s_layout);
+    s_layout = want;
+    return changed;
+}
+
+// ===========================================================================
+// Google TV Remote (G20BTS / G9N9N) HID report
+//
+// Unlike the RC003, which packs 16-bit HID keyboard usages into its report,
+// the Google TV Remote sends a report ID followed by a one-byte *button
+// index* (0x01..0x0D while held, 0x00 on release). None of those values are
+// HID usages, which is why every button used to be dropped as an unknown key
+// code. Observed layouts:
+//
+//   [01 00]                    report ID 1, all released
+//   [01 NN]                    report ID 1, button index NN held
+//   [01 NN 00]                 same with a trailing pad byte
+//   [02 NN 00 00 00 00]        report ID 2, same index in byte 1
+//   [NN 00] / [NN 00 00 00 00 00]  no report ID, index in byte 0
+//
+// The parser below accepts all of them and converts the index into the
+// MI_KEY_GTV_* canonical codes defined in keymap/key_definitions.h.
+// ===========================================================================
+static uint32_t s_raw_report_count = 0;
+#define RAW_REPORT_LOG_LIMIT 64
+
+// Last report printed by the learn trace, so a held button - which repeats the
+// same report - produces one line instead of a stream.
+static uint8_t s_learn_last[16];
+static size_t  s_learn_last_len = 0;
+// Number of ATVV audio notifications to dump as hex while the raw log is on.
+// 64 notifications is roughly 1.3 kB, which is what it takes to answer the
+// questions the decoder cannot be asked on its own: whether the stream carries a
+// per-block header (look for periodic plateaus and full-scale runs) and whether
+// the remote's encoder restarts its predictor on every block. Eight was enough
+// to recognise a codec, but less than one 134-byte ATVV frame - not enough to
+// see any structure at all.
+#define AUDIO_DUMP_FRAMES 64
+// Notifications to skip before dumping. The first fraction of a second of a
+// session is near-silence - the microphone has just been powered up and the
+// user has not spoken yet - and a stream of near-zero nibbles says nothing about
+// the block structure. One second in, the user is talking.
+#define AUDIO_DUMP_SKIP 200
+static int s_aud_dump_remaining = 0;
+static int s_aud_dump_skip = 0;
+
+// Sessions left that dump their raw audio automatically. Two is enough to see
+// the stream structure twice over, and keeps the log readable afterwards: the
+// alternative was asking the user to find and toggle "raw report" in the
+// config site before every diagnostic run, which is exactly the kind of step
+// that gets forgotten and then wastes a round trip.
+static int s_dump_sessions_left = 2;
+
+static void atvv_audio_arm_dump(void)
+{
+    if (s_dump_sessions_left > 0) {
+        s_dump_sessions_left--;
+        s_aud_dump_skip = AUDIO_DUMP_SKIP;
+        s_aud_dump_remaining = AUDIO_DUMP_FRAMES;
+    }
+}
+
+void ble_remote_set_raw_report_log(bool on)
+{
+    s_raw_report_log = on;
+    s_raw_report_count = 0;
+    s_learn_last_len = 0;
+    s_aud_dump_skip = 0;                     // explicit request: dump immediately
+    s_aud_dump_remaining = on ? AUDIO_DUMP_FRAMES : 0;
+    app_log("HOGP", "raw report log %s", on ? "on" : "off");
+}
+
+static void handle_hid_release(void)
+{
+    if (s_pressed_count == 0) return;
+    for (int i = 0; i < s_pressed_count; i++) {
+        if (s_pressed[i] <= 0xFF) {
+            key_engine_feed_key(&g_key_engine, (uint8_t)s_pressed[i], false, now_ms());
+        }
+    }
+    s_pressed_count = 0;
+}
+
+// The remote exposes TWO HID report characteristics with *independent* index
+// spaces, and that is the whole source of the "wrong button" and "several
+// buttons trigger the assistant" reports:
+//
+//   main report   (2-byte `[idx, 0]`, chr handle 0x0021, entry 1 below)
+//       idx 1..7  = up, down, left, right, select, back, home
+//       idx 9..13 = mute, preset app 1, preset app 2, power, input
+//       (idx 8 is not used by this remote)
+//   second report (6-byte `[idx, 0, 0, 0, 0, 0]`, chr handle 0x001D, entry 0)
+//       idx 1 = volume up, idx 2 = volume down
+//
+// Index 1 therefore means "up" in one report and "volume up" in the other, and
+// index 2 means "down" in one and "volume down" in the other. Resolving both
+// through a single index -> slot table made those pairs indistinguishable:
+// pressing volume-up ran the *power* slot's action and pressing down ran the
+// *assistant* slot's action. The index is only unique per report, so the report
+// has to be part of the identity.
+//
+// The assistant button is deliberately absent: it sends NO HID report at all. It
+// announces itself with an ATVV AUDIO_START on the control characteristic, which
+// handle_atvv_ctl() already turns into a voice press - so it keeps working
+// without an entry here, and adding one would create a second, competing path.
+//
+// Which characteristic is which is derived, not assumed: discovery subscribes
+// 0x001D first and 0x0021 second, and every 2-byte button report in the captures
+// arrives as `NOTIFY: handle=0x0021`. The 6-byte volume reports must therefore
+// come from 0x001D, i.e. entry 0 of s_hid_report_chrs[].
+#define GTV_REPORT_SECONDARY 0
+
+// Map (report characteristic index, button index) to the canonical key code.
+// Returns 0 for a combination this remote does not define; the caller logs the
+// raw bytes then, so an unrecognised button is visible instead of silent.
+//
+// These codes are the *shared* ones the keymap stores, so each button lands on
+// the same physical slot as it would on the Xiaomi remote - which is why the
+// built-in slot names and the factory key map both line up without changes.
+static uint8_t google_tv_index_to_key(int chr_index, int index)
+{
+    if (chr_index == GTV_REPORT_SECONDARY) {
+        switch (index) {
+            case 1:  return MI_KEY_VOL_UP;
+            case 2:  return MI_KEY_VOL_DOWN;
+            default: return 0;
+        }
+    }
+    switch (index) {
+        case 1:  return MI_KEY_UP;
+        case 2:  return MI_KEY_DOWN;
+        case 3:  return MI_KEY_LEFT;
+        case 4:  return MI_KEY_RIGHT;
+        case 5:  return MI_KEY_OK;
+        case 6:  return MI_KEY_BACK;
+        case 7:  return MI_KEY_HOME;
+        case 9:  return MI_KEY_GTV_MUTE;
+        case 10: return MI_KEY_GTV_APP_1;     // preset app (YouTube)
+        case 11: return MI_KEY_GTV_APP_2;     // preset app (Netflix)
+        case 12: return MI_KEY_POWER;
+        case 13: return MI_KEY_TV;            // input / source select
+        default: return 0;
+    }
+}
+
+// Human-readable name for the canonical key codes this bridge decodes, used in
+// the key log so a button press is identifiable without a lookup table.
+//
+// A user-defined name wins: the config page lets the user label each physical
+// slot themselves, and the log is the one place where seeing their own label
+// instead of a built-in guess is the whole point.
+static const char *key_code_name(uint8_t key)
+{
+    const char *custom = key_names_get(key_engine_slot_for_vk(key));
+    if (custom[0]) return custom;
+
+    switch (key) {
+        case MI_KEY_POWER:    return "power";
+        case MI_KEY_VOICE:    return "voice";
+        case MI_KEY_UP:       return "up";
+        case MI_KEY_DOWN:     return "down";
+        case MI_KEY_LEFT:     return "left";
+        case MI_KEY_RIGHT:    return "right";
+        case MI_KEY_OK:       return "ok";
+        case MI_KEY_BACK:     return "back";
+        case MI_KEY_HOME:     return "home";
+        case MI_KEY_MENU:     return "menu";
+        case MI_KEY_VOL_UP:   return "vol+";
+        case MI_KEY_VOL_DOWN: return "vol-";
+        case MI_KEY_TV:       return "input";
+        case MI_KEY_GTV_MUTE: return "mute";
+        case MI_KEY_GTV_APP_1:return "app1";
+        case MI_KEY_GTV_APP_2:return "app2";
+        default:              return "?";
+    }
+}
+
+static void handle_google_tv_report(const uint8_t *data, size_t len, int chr_index)
+{
+    // Locate the button index: the first non-zero byte. Observed layouts are
+    // `[01 NN]`, `[01 NN 00]`, `[02 NN 00 00 00 00]` and `[NN 00 ...]`, i.e.
+    // either a report ID followed by the index or the index first, always with
+    // zero padding. All-zero reports (releases) never reach this function.
+    int index = -1;
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] != 0) {
+            index = data[i];
+            break;
+        }
+    }
+
+    uint8_t new_key = 0;
+    if (index > 0) {
+        new_key = google_tv_index_to_key(chr_index, index);
+        if (new_key == 0) {
+            // Unknown button: state the report it came from and the raw bytes so
+            // the table can be extended from a real capture instead of
+            // guesswork. Rate limited.
+            static uint32_t s_warned = 0;
+            if (s_warned < 16) {
+                s_warned++;
+                app_log("HOGP", "chr#%d index %d (0x%02X) has no key mapping",
+                        chr_index, index, index);
+            }
+            return;
+        }
+    }
+
+    if (s_pressed_count > 0 && s_pressed[0] == new_key) {
+        return;  // same button still held; the remote repeats the report
+    }
+
+    handle_hid_release();
+    if (new_key == 0) return;
+
+    s_pressed[0] = new_key;
+    s_pressed_count = 1;
+    app_log("HOGP", "button chr#%d idx=%d -> key 0x%02X (%s) DOWN", chr_index, index,
+            new_key, key_code_name(new_key));
+
+    // The ATVV microphone stream is opened by whichever button the *keymap* has
+    // bound to the voice action, not by a fixed index. Keying it off a hard-coded
+    // code meant the mic only ever opened for one particular button: move the
+    // voice action to the key you actually press and voice input went dead while
+    // the hotkey still fired. Reading the binding keeps the two together.
+    key_binding_t binding = {0};
+    bool wants_mic = false;
+    if (key_engine_get_binding(&g_key_engine, new_key, &binding)) {
+        wants_mic = (binding.has_click && binding.click_action.type == ACTION_VOICE_HOLD) ||
+                    (binding.has_long && binding.long_action.type == ACTION_VOICE_HOLD);
+    }
+    if (wants_mic) {
+        atvv_send_mic_open();
+    }
+    key_engine_feed_key(&g_key_engine, new_key, true, now_ms());
+}
+
+static void handle_hid_report(const uint8_t *data, size_t len, int chr_index)
 {
     if (len == 0) return;
 
-    // RC003 HOGP input report: report ID 1 followed by an array of 16-bit
-    // little-endian keyboard usages (6 or 7 bytes total).
-    uint16_t usages[4];
+    s_reports_seen_total++;
+
+    // An all-zero report means "all keys released". Every byte must be checked,
+    // including byte 0: this remote reports `[index, 0x00]`, so the index lives
+    // in byte 0 and byte 1 is the zero padding. Skipping byte 0 here made every
+    // button press look like a release and silently discarded it.
+    bool any = false;
+    for (size_t i = 0; i < len; i++) {
+        if (data[i] != 0) { any = true; break; }
+    }
+    if (!any) {
+        s_release_calls++;
+        s_learn_last_len = 0;  // so the next press of the same button is traced again
+        handle_hid_release();
+        return;
+    }
+
+    s_reports_press_total++;
+
+    // Unconditional trace of the first notifications of a session. Deliberately
+    // independent of every later decision: this is the record that shows what
+    // the remote actually sends, so a parsing mistake cannot hide the evidence.
+    if (s_reports_press_total <= 32) {
+        char hex[3 * 24 + 1];
+        size_t n = (len < 24) ? len : 24;
+        for (size_t i = 0; i < n; i++) {
+            snprintf(&hex[i * 3], 4, "%02X ", data[i]);
+        }
+        hex[n * 3] = '\0';
+        app_log("HOGP", "rx#%d len=%u [%s]", chr_index, (unsigned)len, hex);
+    }
+
+    // Learn trace: while the raw-report log is on, print one line per *distinct*
+    // report. The config page's button-learning panel reads these lines out of
+    // the log, so exactly one line per press - and none for the repeated reports
+    // a held button produces - is what makes "press a button, see which slot it
+    // landed in" work without the firmware having to know what the button means.
+    if (s_raw_report_log) {
+        size_t n = (len < sizeof(s_learn_last)) ? len : sizeof(s_learn_last);
+        if (n != s_learn_last_len || memcmp(s_learn_last, data, n) != 0) {
+            memcpy(s_learn_last, data, n);
+            s_learn_last_len = n;
+            char hex[3 * sizeof(s_learn_last) + 1];
+            for (size_t i = 0; i < n; i++) {
+                snprintf(&hex[i * 3], 4, "%02X ", data[i]);
+            }
+            hex[n * 3] = '\0';
+            app_log("LEARN", "chr#%d len=%u [%s]", chr_index, (unsigned)len, hex);
+        }
+    }
+
+    // Dispatch on the report length rather than on the remote's advertised
+    // name. The RC003 sends 7-byte (report ID + three 16-bit usages) and
+    // occasional 8-byte boot-keyboard reports; the Google TV Remote sends a
+    // single-byte button index in a 1..6 byte report. An explicit layout
+    // override still forces one parser for a remote that breaks this rule.
+    bool use_rc003 = (s_layout_override == REMOTE_LAYOUT_RC003) ||
+                     (s_layout_override == REMOTE_LAYOUT_UNKNOWN && (len == 7 || len == 8));
+    if (!use_rc003) {
+        s_gtv_calls++;
+        handle_google_tv_report(data, len, chr_index);
+        return;
+    }
+    s_rc003_calls++;
+
+    // Distinct keys that can be reported at once. The RC003 packs up to three
+    // 16-bit usages; a boot keyboard report has six slots.
+    uint16_t usages[6];
     int usage_count = 0;
 
-    if (len == 8) {
-        // Standard 8-byte boot keyboard report: modifiers, reserved, key0..5
-        if (data[2] != 0) {
-            usages[usage_count++] = data[2];
+    if (len >= 8) {
+        // Classic boot keyboard report [modifier, reserved, k0..k5]. The
+        // previous code only looked at k0, so a combination could never be
+        // detected.
+        for (size_t i = 2; i < len && usage_count < (int)(sizeof(usages) / sizeof(usages[0])); i++) {
+            if (data[i] != 0) usages[usage_count++] = data[i];
         }
     } else {
+        // RC003 HOGP report: leading report ID 1 followed by 16-bit
+        // little-endian keyboard usages.
         const uint8_t *p = data;
         size_t n = len;
-        if ((n == 7) && (p[0] == 0x01)) {
-            p++; n--;
+        if ((n % 2) == 1 && p[0] == 0x01) {
+            p++;
+            n--;
         }
         if ((n % 2) == 0) {
-            for (size_t i = 0; i + 1 < n && usage_count < 4; i += 2) {
+            for (size_t i = 0; i + 1 < n && usage_count < (int)(sizeof(usages) / sizeof(usages[0])); i += 2) {
                 uint16_t u = (uint16_t)(p[i] | (p[i + 1] << 8));
                 if (u != 0) usages[usage_count++] = u;
             }
         }
+    }
+
+    if (usage_count == 0) {
+        // Nothing that looks like a HID usage. Log the bytes once so an
+        // unrecognised report shape is visible instead of silently dropped.
+        if (s_raw_report_log && s_raw_report_count < RAW_REPORT_LOG_LIMIT) {
+            char hex[3 * 24 + 1];
+            size_t n = (len < 24) ? len : 24;
+            for (size_t i = 0; i < n; i++) snprintf(&hex[i * 3], 4, "%02X ", data[i]);
+            hex[n * 3] = '\0';
+            app_log("HOGP", "unparsed report len=%u [%s]", (unsigned)len, hex);
+            s_raw_report_count++;
+        }
+        return;
     }
 
     // Diff against the previously pressed set.
@@ -516,10 +1034,7 @@ static void handle_hid_report(const uint8_t *data, size_t len)
         if (!was && usages[j] <= 0xFF) {
             app_log("HOGP", "Key usage 0x%02X DOWN", usages[j]);
             if (usages[j] == MI_KEY_VOICE_ALT || usages[j] == MI_KEY_VOICE) {
-                if (s_atvv_cmd_chr) {
-                    static const uint8_t cmd_open[2] = { 0x0C, 0x00 };
-                    ble_gattc_write_flat(s_conn_handle, s_atvv_cmd_chr, cmd_open, 2, NULL, NULL);
-                }
+                atvv_send_mic_open();
             }
             key_engine_feed_key(&g_key_engine, (uint8_t)usages[j], true, now_ms());
         }
@@ -670,8 +1185,11 @@ static bool adv_is_target(const ble_addr_t *addr, const char *name, const uint8_
         return false;
     }
 
-    if (name && (strstr(name, "MI RC") || strstr(name, "Xiaomi") ||
-                 strstr(name, "Remote") || strstr(name, "小米") || strstr(name, "遥控"))) {
+    if (name && (strstr(name, BLE_REMOTE_NAME_PREFIX) ||
+                 strstr(name, BLE_REMOTE_NAME_EXTRA_1) ||
+                 strstr(name, BLE_REMOTE_NAME_EXTRA_2) ||
+                 strstr(name, "Xiaomi") || strstr(name, "Remote") ||
+                 strstr(name, "小米") || strstr(name, "遥控"))) {
         return true;
     }
 
@@ -789,8 +1307,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             led_indicator_set(LED_STATE_WAIT_CONNECTION);
             break;
 
-        case BLE_GAP_EVENT_ENC_CHANGE: {
-            struct ble_gap_conn_desc desc;
+        case BLE_GAP_EVENT_ENC_CHANGE: {            struct ble_gap_conn_desc desc;
             if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0) {
                 app_log("BLE", "Encryption change: status=%d encrypted=%d bonded=%d authenticated=%d",
                         event->enc_change.status, desc.sec_state.encrypted,
@@ -828,14 +1345,40 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             if (len > sizeof(buf)) len = sizeof(buf);
             if (os_mbuf_copydata(om, 0, len, buf) != 0) break;
 
+            // Trace the first notifications of every kind, with the attribute
+            // handle. This is the ground truth for "which characteristic is the
+            // remote actually notifying on", which a missing subscription or a
+            // mismatched handle would otherwise hide.
+            if (s_notify_trace < 48 && handle != s_atvv_aud_chr) {
+                s_notify_trace++;
+                char hex[3 * 16 + 1];
+                size_t n = (len < 16) ? len : 16;
+                for (size_t i = 0; i < n; i++) snprintf(&hex[i * 3], 4, "%02X ", buf[i]);
+                hex[n * 3] = '\0';
+                app_log("NOTIFY", "handle=0x%04X len=%u [%s]", handle, (unsigned)len, hex);
+            }
+
             if (handle == s_atvv_aud_chr) {
-                audio_pipeline_feed_adpcm(&g_audio_pipeline, buf, len);
+                if (s_aud_dump_skip > 0) {
+                    s_aud_dump_skip--;
+                } else if (s_aud_dump_remaining > 0) {
+                    s_aud_dump_remaining--;
+                    char hex[3 * 48 + 1];
+                    size_t n = (len < 48) ? len : 48;
+                    for (size_t i = 0; i < n; i++) {
+                        snprintf(&hex[i * 3], 4, "%02X ", buf[i]);
+                    }
+                    hex[n * 3] = '\0';
+                    app_log("ATVV", "audio len=%u [%s]", (unsigned)len, hex);
+                }
+                atvv_audio_note_frame(len);
+                atvv_audio_feed(buf, len);
             } else if (handle == s_atvv_ctl_chr) {
                 handle_atvv_ctl(buf, len);
             } else {
                 for (int i = 0; i < s_hid_report_count; i++) {
                     if (handle == s_hid_report_chrs[i]) {
-                        handle_hid_report(buf, len);
+                        handle_hid_report(buf, len, i);
                         break;
                     }
                 }
@@ -847,6 +1390,85 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             break;
     }
     return 0;
+}
+
+// ===========================================================================
+// ATVV audio notification profile
+//
+// The RC003 streams 120-byte IMA-ADPCM frames (16 kHz), while the Google TV
+// Remote was measured sending ~20-byte frames at ~12.5 Hz. Track the size
+// histogram and the notification rate so the log states what the remote
+// actually sends instead of assuming the Xiaomi numbers.
+// ===========================================================================
+static uint32_t s_aud_frame_total = 0;
+static uint32_t s_aud_bytes_total = 0;
+static uint32_t s_aud_last_ms = 0;
+static uint32_t s_aud_min_ms = 0xFFFFFFFFu;
+static uint32_t s_aud_max_ms = 0;
+static uint16_t s_aud_len_min = 0xFFFF;
+static uint16_t s_aud_len_max = 0;
+
+static void atvv_audio_reset_stats(void)
+{
+    s_aud_frame_total = 0;
+    s_aud_bytes_total = 0;
+    s_aud_last_ms = 0;
+    s_aud_min_ms = 0xFFFFFFFFu;
+    s_aud_max_ms = 0;
+    s_aud_len_min = 0xFFFF;
+    s_aud_len_max = 0;
+}
+
+static void atvv_audio_note_frame(uint16_t len)
+{
+    uint32_t now = now_ms();
+    if (s_aud_last_ms != 0) {
+        uint32_t dt = now - s_aud_last_ms;
+        if (dt < s_aud_min_ms) s_aud_min_ms = dt;
+        if (dt > s_aud_max_ms) s_aud_max_ms = dt;
+    }
+    s_aud_last_ms = now;
+    s_aud_frame_total++;
+    s_aud_bytes_total += len;
+    if (len < s_aud_len_min) s_aud_len_min = len;
+    if (len > s_aud_len_max) s_aud_len_max = len;
+}
+
+static void atvv_audio_log_stats(void)
+{
+    if (s_aud_frame_total == 0) {
+        app_log("ATVV", "audio: no frames received");
+        return;
+    }
+    atvv_audio_stats_t st;
+    atvv_audio_get_stats(&st);
+    uint32_t span = (s_aud_last_ms != 0 && s_aud_max_ms != 0)
+                        ? (s_aud_last_ms - s_aud_max_ms)
+                        : 0;
+    app_log("ATVV", "audio: %lu packet(s) -> %lu frame(s), len %u..%u, interval %lu..%lu ms",
+            (unsigned long)s_aud_frame_total, (unsigned long)st.frames,
+            (unsigned)s_aud_len_min, (unsigned)s_aud_len_max,
+            (unsigned long)((s_aud_min_ms == 0xFFFFFFFFu) ? 0 : s_aud_min_ms),
+            (unsigned long)s_aud_max_ms);
+    if (atvv_audio_header_detected()) {
+        app_log("ATVV", "ATVV framing: ver=0x%02X frame=%u codec=0x%02X resync=%lu dropped=%lu",
+                st.version, (unsigned)st.last_frame_number, st.codec_bits,
+                (unsigned long)st.resyncs, (unsigned long)st.dropped_packets);
+        const char *rate = (st.codec_bits & 0x04) ? "16 kHz"
+                           : (st.codec_bits & 0x02) ? "8 kHz" : "unspecified";
+        app_log("ATVV", "ATVV codec: ADPCM %s (firmware built for %d Hz)",
+                rate, AUDIO_SAMPLE_RATE);
+    } else {
+        app_log("ATVV", "bare payload stream (no ATVV header), span %lu ms",
+                (unsigned long)span);
+    }
+}
+
+// Called by the ATVV frame assembler with whole 128-byte payloads (conforming
+// remote) or with raw notifications (bare-payload remote).
+void atvv_audio_payload_ready(const uint8_t *payload, size_t len)
+{
+    audio_pipeline_feed_adpcm(&g_audio_pipeline, payload, len);
 }
 
 // ===========================================================================
@@ -988,6 +1610,8 @@ void ble_remote_task(void)
             strncpy(s_connected_mac, s_pending_mac, sizeof(s_connected_mac) - 1);
             strncpy(s_connected_name, s_pending_name[0] ? s_pending_name : "Xiaomi Voice Remote",
                     sizeof(s_connected_name) - 1);
+            // Pick the report parser before the first notification can arrive.
+            apply_layout_for_connection(s_connected_name);
             do_connect_addr(&addr);
         }
     }
@@ -1001,6 +1625,43 @@ void ble_remote_task(void)
 
     if (s_state == BLE_STATE_DISCONNECTED) {
         start_scan();
+    }
+
+    // Periodic reachability report. This is the only way to tell "the remote is
+    // not sending notifications" apart from "the parser rejected them": the
+    // counter increments for every notification that arrives on any subscribed
+    // HID report characteristic, before any interpretation happens.
+    if (s_state == BLE_STATE_CONNECTED || s_state == BLE_STATE_TALKING) {
+        if ((now - s_health_last_ms) >= 5000) {
+            s_health_last_ms = now;
+            uint32_t reports = s_reports_seen_total - s_health_last_reports;
+            s_health_last_reports = s_reports_seen_total;
+            // nvs= is the NVS partition's used-entry count. It is the flash-wear
+            // gauge: any write, from this firmware or from the NimBLE bond store,
+            // moves it. A value that holds steady while the remote is used means
+            // nothing is programming flash.
+            uint32_t nvs_used = 0;
+            config_store_get_usage(&nvs_used, NULL, NULL);
+            app_log("HEALTH", "rx=%lu total=%lu release=%lu gtv=%lu rc003=%lu layout=%s nvs=%lu",
+                    (unsigned long)reports, (unsigned long)s_reports_seen_total,
+                    (unsigned long)s_release_calls, (unsigned long)s_gtv_calls,
+                    (unsigned long)s_rc003_calls, ble_remote_layout_name(),
+                    (unsigned long)nvs_used);
+        }
+    } else {
+        s_health_last_ms = now;
+        s_health_last_reports = s_reports_seen_total;
+    }
+
+    // Backstop: a microphone session must not outlive the specification's own
+    // session timer, even if AUDIO_STOP never arrives.
+    if (s_state == BLE_STATE_TALKING && (now - s_talking_start_ms) > VOICE_SESSION_MAX_MS) {
+        app_log("ATVV", "Voice session exceeded %d ms -> closing microphone",
+                VOICE_SESSION_MAX_MS);
+        s_state = BLE_STATE_CONNECTED;
+        atvv_audio_log_stats();
+        atvv_send_mic_close();
+        key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, false, now);
     }
 
     // Refresh the remote battery level periodically while connected.

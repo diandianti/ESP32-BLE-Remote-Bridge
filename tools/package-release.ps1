@@ -66,7 +66,7 @@ flash.bat -Baud 460800        指定波特率
 
 浏览器在线烧录
 --------------
-https://ncmro7.github.io/MI-RC003-ESP32-Bridge/flash/
+https://diandianti.github.io/ESP32-BLE-Remote-Bridge/flash/
 
 本包内 esptool.exe 来自 https://github.com/espressif/esptool (v$EsptoolVersion)，
 遵循其原始许可证，详见 LICENSE-esptool.txt。

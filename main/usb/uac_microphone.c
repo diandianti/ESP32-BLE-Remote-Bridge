@@ -20,8 +20,11 @@ static bool s_uac_initialized = false;
 static uint8_t s_mic_mute = 0;
 static int16_t s_mic_volume = 0x0000;
 
-// 32 samples (64 bytes) per 2 ms isochronous transfer.
-static DRAM_ATTR int16_t s_tx_buf[32];
+// One isochronous transfer: 2 ms of mono 16-bit audio at AUDIO_SAMPLE_RATE
+// (64 bytes / 32 samples at 16 kHz, 32 bytes / 16 samples at 8 kHz). The size
+// is derived in app_config.h so it always matches the descriptor, which the
+// host validates.
+static DRAM_ATTR int16_t s_tx_buf[USB_UAC_PACKET_SAMPLES];
 
 // DWC2 register helpers used by the recovery watchdog.
 #define DWC2_USB_BASE       0x60080000
@@ -87,7 +90,7 @@ static void uac_stream_task(void *arg)
 
         memset(s_tx_buf, 0, sizeof(s_tx_buf));
         if (!s_mic_mute) {
-            audio_pipeline_read_for_usb(&g_audio_pipeline, s_tx_buf, 32);
+            audio_pipeline_read_for_usb(&g_audio_pipeline, s_tx_buf, USB_UAC_PACKET_SAMPLES);
         }
         usbd_edpt_xfer(0, ep, (uint8_t *)s_tx_buf, sizeof(s_tx_buf));
     }
@@ -146,6 +149,13 @@ static bool uac_driver_control_xfer_cb(uint8_t rhport, uint8_t stage,
             uint8_t alt = (uint8_t)req->wValue;
             s_uac_alt = alt;
             s_uac_streaming = (alt == 1);
+
+            // The host selecting alternate setting 1 is what starts capture.
+            // Logged because it is the one step of the microphone path that
+            // happens entirely on the host side: if this never appears, nothing
+            // in the firmware is at fault - no application is recording.
+            app_log("UAC", "Host SET_INTERFACE itf=%u alt=%u -> streaming=%d",
+                    (unsigned)itf, (unsigned)alt, s_uac_streaming ? 1 : 0);
 
             // The isochronous IN endpoint is opened once in uac_driver_open().
             // Do NOT close/reopen it here: the ESP32-S3 DWC2 port does not

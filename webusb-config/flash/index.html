@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#fbfbfd" />
-  <title>MI-RC003 Bridge - 固件在线烧录</title>
+  <title>ESP32 BLE Remote Bridge - 固件在线烧录</title>
   <script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
   <style>
     :root {
@@ -92,9 +92,9 @@
   </style>
 </head>
 <body>
-  <div class="logo">MIRC<span>003</span></div>
-  <h1>固件在线烧录</h1>
-  <p class="sub">小米蓝牙遥控器 2 Pro (RC003) · ESP32-S3 · <span id="fw-version">读取中…</span></p>
+  <div class="logo">BLE<span>REMOTE</span></div>
+  <h1>ESP32 BLE Remote Bridge · 固件在线烧录</h1>
+  <p class="sub">小米蓝牙遥控器 2 Pro (RC003) / Google TV Remote · ESP32-S3 · <span id="fw-version">读取中…</span></p>
 
   <div class="card">
     <h3 style="margin-top:0">选择硬件版本</h3>
@@ -131,8 +131,14 @@
       <li>烧录完成后，前往 <a href="../">配置中心</a> 连接设备进行按键与蓝牙设置。</li>
     </ol>
     <div class="note">
-      若无法识别设备：按住 <code>BOOT</code> 键 → 点按一下 <code>RST</code> → 松开 <code>BOOT</code>，
-      再点击烧录按钮。仍然失败请检查 USB 数据线（需支持数据传输）与串口驱动。
+      <strong>串口怎么选：</strong>开发板有两个 USB 口。选 <strong>UART 口</strong>（COM 桥）对应的串口最省事，
+      它带自动复位电路，可以直接开始烧录；选 <strong>原生 USB 口</strong>时若无法识别，
+      请按住 <code>BOOT</code> 键 → 点按一下 <code>RST</code> → 松开 <code>BOOT</code>，再点击烧录按钮。
+      仍然失败请检查 USB 数据线（需支持数据传输）与串口驱动。
+    </div>
+    <div class="note">
+      首次烧录会询问是否擦除 Flash，选择“擦除”即可。擦除会清空按键映射与蓝牙配对记录，
+      但按键映射可以先用 <strong>导出</strong> 备份成 JSON（配置中心 → 系统设置 → 原始 JSON）。
     </div>
   </div>
 

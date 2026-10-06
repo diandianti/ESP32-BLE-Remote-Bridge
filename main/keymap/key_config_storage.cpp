@@ -46,6 +46,37 @@ typedef struct __attribute__((packed)) {
 
 static SemaphoreHandle_t s_save_sem = NULL;
 
+// Shadow of what is currently in NVS, per key. A save skips any key whose bytes
+// are unchanged: flash wear is dominated by how often a page gets programmed,
+// not by how much is written, so rewriting an untouched layer is pure cost.
+// Without this, editing one layer rewrote all seven keys.
+static uint8_t *s_shadow[MAX_LAYERS];
+static size_t   s_shadow_len[MAX_LAYERS];
+static uint8_t *s_switch_shadow = NULL;
+static size_t   s_switch_shadow_len = 0;
+
+// Forget the shadow so the next save rewrites everything (a blob is never zero
+// bytes long, so a zero length reliably means "unknown").
+static void shadow_invalidate(void)
+{
+    for (int i = 0; i < MAX_LAYERS; i++) {
+        s_shadow_len[i] = 0;
+    }
+    s_switch_shadow_len = 0;
+}
+
+static void shadow_alloc(void)
+{
+    for (int i = 0; i < MAX_LAYERS; i++) {
+        if (!s_shadow[i]) {
+            s_shadow[i] = (uint8_t *)heap_caps_malloc(LAYER_BLOB_MAX, MALLOC_CAP_SPIRAM);
+        }
+    }
+    if (!s_switch_shadow) {
+        s_switch_shadow = (uint8_t *)heap_caps_malloc(sizeof(switch_blob_t), MALLOC_CAP_SPIRAM);
+    }
+}
+
 static void layer_key(char *buf, size_t buf_len, int idx)
 {
     snprintf(buf, buf_len, "layer%d", idx);
@@ -349,6 +380,7 @@ bool key_config_storage_save(key_mapper_engine_t *engine)
 {
     if (!engine) return false;
 
+    shadow_alloc();
     uint8_t *buf = (uint8_t *)heap_caps_malloc(LAYER_BLOB_MAX, MALLOC_CAP_SPIRAM);
     if (!buf) {
         app_log("KEYMAP", "no memory for save");
@@ -364,6 +396,7 @@ bool key_config_storage_save(key_mapper_engine_t *engine)
 
     key_engine_lock();
     bool ok = true;
+    int written = 0;
     for (int i = 0; i < MAX_LAYERS; i++) {
         key_layer_t *layer = &engine->layers[i];
         layer_hdr_t *hdr = (layer_hdr_t *)buf;
@@ -382,12 +415,23 @@ bool key_config_storage_save(key_mapper_engine_t *engine)
             blen += bbytes;
         }
 
+        if (s_shadow[i] && s_shadow_len[i] == blen &&
+            memcmp(s_shadow[i], buf, blen) == 0) {
+            continue;  // byte-for-byte what is already on flash
+        }
+
         char key[8];
         layer_key(key, sizeof(key), i);
         if (nvs_set_blob(h, key, buf, blen) != ESP_OK) {
             app_log("KEYMAP", "NVS write failed for %s", key);
             ok = false;
+            continue;
         }
+        if (s_shadow[i]) {
+            memcpy(s_shadow[i], buf, blen);
+            s_shadow_len[i] = blen;
+        }
+        written++;
     }
 
     switch_blob_t *sb = (switch_blob_t *)buf;
@@ -398,14 +442,32 @@ bool key_config_storage_save(key_mapper_engine_t *engine)
         memcpy(sb->entries, engine->switch_map,
                engine->switch_map_count * sizeof(key_switch_map_entry_t));
     }
-    if (nvs_set_blob(h, SWITCH_NVS_KEY, sb, sizeof(switch_blob_t)) != ESP_OK) {
-        app_log("KEYMAP", "NVS write failed for %s", SWITCH_NVS_KEY);
-        ok = false;
+    if (!(s_switch_shadow && s_switch_shadow_len == sizeof(switch_blob_t) &&
+          memcmp(s_switch_shadow, sb, sizeof(switch_blob_t)) == 0)) {
+        if (nvs_set_blob(h, SWITCH_NVS_KEY, sb, sizeof(switch_blob_t)) != ESP_OK) {
+            app_log("KEYMAP", "NVS write failed for %s", SWITCH_NVS_KEY);
+            ok = false;
+        } else {
+            if (s_switch_shadow) {
+                memcpy(s_switch_shadow, sb, sizeof(switch_blob_t));
+                s_switch_shadow_len = sizeof(switch_blob_t);
+            }
+            written++;
+        }
     }
 
-    uint8_t active = engine->active_layer;
-    nvs_set_blob(h, "active", &active, 1);
+    // "active" is deliberately not written here either: the selected layer is
+    // runtime state, so nothing in this file records it.
     key_engine_unlock();
+
+    // Nothing changed: skip the commit entirely. A commit is what actually
+    // programs a flash page, so this is the difference between "no wear" and
+    // "one worn page" for a save that had nothing to record.
+    if (written == 0) {
+        nvs_close(h);
+        heap_caps_free(buf);
+        return true;
+    }
 
     if (ok && nvs_commit(h) != ESP_OK) {
         app_log("KEYMAP", "NVS commit failed");
@@ -415,7 +477,7 @@ bool key_config_storage_save(key_mapper_engine_t *engine)
     heap_caps_free(buf);
 
     if (ok) {
-        app_log("KEYMAP", "Keymap saved to NVS");
+        app_log("KEYMAP", "Keymap saved to NVS (%d key(s) changed)", written);
     }
     return ok;
 }
@@ -482,11 +544,12 @@ bool key_config_storage_load(key_mapper_engine_t *engine)
         }
     }
 
+    // The active layer is deliberately NOT restored. Which layer is selected is
+    // runtime state, not configuration, and persisting it meant a flash write
+    // every time the user switched layers - which the switch map turns into a
+    // routine keypress. A device always starts on layer 0; "active" is only
+    // erased below, to clear a value left by an older firmware.
     uint8_t active = 0;
-    size_t alen = 1;
-    if (nvs_get_blob(h, "active", &active, &alen) != ESP_OK || active >= MAX_LAYERS) {
-        active = 0;
-    }
 
     key_switch_map_entry_t smap_load[MAX_SWITCH_MAP];
     size_t smap_load_n = 0;
@@ -531,8 +594,10 @@ bool key_config_storage_load(key_mapper_engine_t *engine)
     return true;
 }
 
-// Deferred save: the WebUSB task responds first, then this task writes to
-// flash ~150 ms later so the NVS flash operation does not stall the USB reply.
+// Deferred save: the caller responds first, then this task writes to flash
+// ~150 ms later so the NVS flash operation does not stall the USB reply. The
+// delay also coalesces a burst of requests (the config page renames one button
+// per request) into a single write.
 static void keymap_save_task(void *arg)
 {
     (void)arg;
@@ -544,6 +609,9 @@ static void keymap_save_task(void *arg)
     }
 }
 
+// Only configuration changes are ever routed here. Anything that is runtime
+// state - which layer is selected, which key is held - stays in RAM and never
+// reaches flash.
 void key_config_storage_request_save(void)
 {
     if (s_save_sem) {
@@ -558,8 +626,7 @@ void key_config_storage_init(key_mapper_engine_t *engine)
         xTaskCreate(keymap_save_task, "keymap_save", 4096, NULL, 3, NULL);
     }
     if (key_config_storage_load(engine)) {
-        app_log("KEYMAP", "Loaded custom keymap from NVS (active layer %u)",
-                (unsigned)engine->active_layer);
+        app_log("KEYMAP", "Loaded custom keymap from NVS");
     } else {
         app_log("KEYMAP", "Loaded factory default keymap");
     }
@@ -575,6 +642,7 @@ void key_config_storage_reset_defaults(key_mapper_engine_t *engine)
     }
     config_store_erase_key(KEYMAP_NS, "active");
     config_store_erase_key(KEYMAP_NS, SWITCH_NVS_KEY);
+    shadow_invalidate();
 
     key_engine_lock();
     key_engine_load_defaults(engine);

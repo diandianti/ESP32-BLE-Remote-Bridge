@@ -80,7 +80,13 @@ typedef struct {
     uint8_t  active_layer;
 } key_event_telemetry_t;
 
-#define MAX_KEY_BINDINGS   16
+// Upper bound on bindings per layer, and on physical key slots. The Google TV
+// Remote can report button indices 1..16 (power, assistant, four D-pad
+// directions, select, back, home, menu, volume +/-, input, mute and two
+// preset-app buttons), and the slot used for an index is index-1, so this must
+// stay above 16. get_physical_key_slot() rejects anything at or beyond this
+// bound, which would otherwise silently drop the higher-index buttons.
+#define MAX_KEY_BINDINGS   24
 #define MAX_LAYERS         5
 #define MAX_LAYER_NAME_LEN 24
 #define MAX_SWITCH_MAP     16
@@ -153,6 +159,26 @@ void key_engine_release_all(key_mapper_engine_t *engine, uint32_t now_ms);
 
 /** @brief Return the canonical code of a currently pressed key, or 0 if none. */
 uint8_t key_engine_get_pressed_vk(const key_mapper_engine_t *engine);
+
+/**
+ * @brief Number of physical key slots.
+ *
+ * This is the length of the slot numbering every other keymap concept uses: a
+ * binding's slot, a key name's slot and the index a remote reports (index - 1)
+ * all refer to the same sequence.
+ */
+int key_engine_slot_count(void);
+
+/** @brief Canonical key code for a physical slot, or 0 when out of range. */
+uint8_t key_engine_vk_for_slot(int slot);
+
+/**
+ * @brief Physical slot for a key code, or -1 when the code is not a button.
+ *
+ * Accepts both the canonical codes the keymap stores and the raw codes a
+ * remote reports, so callers do not have to know which one they are holding.
+ */
+int key_engine_slot_for_vk(uint8_t vk);
 
 /** @brief Take/release the engine's recursive mutex (for bulk layer updates). */
 void key_engine_lock(void);

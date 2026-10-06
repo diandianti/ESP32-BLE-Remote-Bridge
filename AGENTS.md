@@ -97,7 +97,7 @@
 ### WebUSB 着陆页
 
 - `main/version.h` 的 `WEBUSB_LANDING_URL` / `WEBUSB_LANDING_SCHEME` 必须与
-  `webusb-config/` 的部署地址一致（生产：`ncmro7.github.io/MI-RC003-ESP32-Bridge/`，scheme=1）。
+  `webusb-config/` 的部署地址一致（本 fork 生产：`diandianti.github.io/ESP32-BLE-Remote-Bridge/`，scheme=1）。
 - 推送到 `main` 后 GitHub Pages 自动部署（`.github/workflows/static.yml`）。
 
 ## 5. `/dist` 烧录软件（Windows 免安装工具）

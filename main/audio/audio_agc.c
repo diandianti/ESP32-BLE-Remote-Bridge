@@ -25,6 +25,7 @@ void audio_agc_process(audio_agc_t *agc, int16_t *samples, size_t count)
     float target = agc->target_level;
     float decay = agc->decay_rate;
     float max_gain = agc->max_gain;
+    float min_gain = AGC_MIN_GAIN;
     float floor_val = agc->noise_floor;
 
     for (size_t i = 0; i < count; i++) {
@@ -39,8 +40,15 @@ void audio_agc_process(audio_agc_t *agc, int16_t *samples, size_t count)
 
         float denom = (peak > floor_val) ? peak : floor_val;
         float gain = target / denom;
+        // Clamp from both ends. The upper clamp is the important one: without it
+        // the gain pins at its maximum whenever the envelope falls to the noise
+        // floor, which amplifies hiss by that factor during every pause. The
+        // lower clamp keeps a loud syllable from being ducked into inaudibility
+        // and from pumping the level on the syllable that follows it.
         if (gain > max_gain) {
             gain = max_gain;
+        } else if (gain < min_gain) {
+            gain = min_gain;
         }
 
         v *= gain;

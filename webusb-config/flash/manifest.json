@@ -1,5 +1,5 @@
 {
-    "name":  "MI-RC003 Bridge N16R8",
+    "name":  "ESP32 BLE Remote Bridge N16R8",
     "version":  "1.3.3",
     "new_install_prompt_erase":  true,
     "builds":  [

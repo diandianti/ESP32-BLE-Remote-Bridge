@@ -15,13 +15,22 @@ extern "C" {
 
 #define AUDIO_JITTER_PREFILL_SAMPLES  1600  // 100 ms prefill cushion to absorb BLE jitter
 
+// Largest encoded block handed to the decoder in one call. 256 bytes is two
+// ATVV payloads, which keeps headroom for the bare-payload RC003 path where a
+// notification can carry several 128-byte frames back to back.
+#define AUDIO_MAX_CHUNK_BYTES         256
+_Static_assert(AUDIO_MAX_CHUNK_BYTES >= AUDIO_DEFAULT_FRAME_BYTES,
+               "decode chunk must hold at least one whole frame");
+
 typedef struct {
     adpcm_state_t        adpcm;
     audio_filter_state_t filter;
     audio_agc_t          agc;
     audio_ring_buffer_t  ring_buf;
     int16_t              ring_storage[AUDIO_RING_BUFFER_SIZE];
-    int16_t              temp_pcm[AUDIO_DEFAULT_FRAME_SAMPS * 2];
+    // Decoding produces two PCM samples per encoded byte, so this holds the
+    // largest block the pipeline will ever be handed (AUDIO_MAX_CHUNK_BYTES).
+    int16_t              temp_pcm[AUDIO_MAX_CHUNK_BYTES * 2];
     uint8_t              session_id;
     bool                 active;
     bool                 buffering;

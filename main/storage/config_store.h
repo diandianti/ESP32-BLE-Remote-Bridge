@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -33,6 +34,21 @@ esp_err_t config_store_erase_ns(const char *ns);
 
 /** @brief Erase the whole NVS partition (factory reset). */
 esp_err_t config_store_erase_all(void);
+
+/**
+ * @brief NVS entry usage, as a flash-wear gauge.
+ *
+ * Partition-level on purpose: a counter inside this module would miss the
+ * NimBLE bond store, which writes to NVS directly. @p used grows with every
+ * write from any source, so a flat value across normal use means nothing is
+ * programming flash. Any out pointer may be NULL.
+ *
+ * @return false when the statistics are unavailable.
+ */
+bool config_store_get_usage(uint32_t *used, uint32_t *free_entries, uint32_t *total);
+
+/** @brief Log the NVS entry usage under @p tag. */
+void config_store_log_usage(const char *tag);
 
 #ifdef __cplusplus
 }

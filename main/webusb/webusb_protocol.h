@@ -26,6 +26,10 @@ enum {
     CMD_BLE_UNPAIR       = 0x22,
     CMD_BLE_INFO         = 0x23,
     CMD_BLE_RECONNECT    = 0x24,
+    CMD_BLE_RAW_REPORT   = 0x25,
+    CMD_BLE_LAYOUT       = 0x26,
+    CMD_KEY_NAMES_GET    = 0x27,
+    CMD_KEY_NAMES_SET    = 0x28,
     CMD_NVS_RESET        = 0x31,
     CMD_SYSTEM_RESTART   = 0x40,
 };

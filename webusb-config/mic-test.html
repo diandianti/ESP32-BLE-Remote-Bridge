@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>麦克风测试 · MI-RC003 Bridge</title>
+<style>
+  :root { --bg:#12141a; --card:#1b1e26; --line:#2a2f3c; --fg:#e6e8ee; --dim:#8a91a3;
+          --accent:#4a9eff; --good:#3ddc84; --warn:#ffb020; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--fg);
+         font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; }
+  main { max-width:760px; margin:0 auto; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  p.sub { color:var(--dim); margin:0 0 20px; font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:18px; margin-bottom:16px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:7px;
+           padding:10px 18px; font-size:14px; cursor:pointer; }
+  button:disabled { background:#39404f; color:var(--dim); cursor:not-allowed; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--fg); }
+  select { background:#12141a; color:var(--fg); border:1px solid var(--line);
+           border-radius:7px; padding:9px; font-size:14px; min-width:280px; }
+  #meter { position:relative; height:34px; border-radius:7px; background:#0c0e13;
+           border:1px solid var(--line); overflow:hidden; margin:16px 0 6px; }
+  #fill { position:absolute; inset:0 100% 0 0; background:linear-gradient(90deg,#3ddc84,#ffb020 70%,#ff4d4f);
+          transition:right .05s linear; }
+  #peak { position:absolute; top:0; bottom:0; width:2px; background:#fff; opacity:.85; left:0; }
+  .readout { font-variant-numeric:tabular-nums; font-size:13px; color:var(--dim); }
+  .readout b { color:var(--fg); font-weight:600; }
+  .state { font-size:14px; padding:8px 12px; border-radius:7px; background:#0c0e13;
+           border:1px solid var(--line); color:var(--dim); }
+  .state.ok { color:var(--good); border-color:#245c3c; }
+  .state.bad { color:#ff6b6b; border-color:#5c2424; }
+  ol { color:var(--dim); font-size:14px; padding-left:20px; margin:8px 0 0; }
+  ol li { margin:4px 0; }
+  audio { width:100%; margin-top:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>麦克风测试</h1>
+  <p class="sub">直接打开 MI-RC003 的采集流，绕开 Windows 设置页面的电平表。</p>
+
+  <div class="card">
+    <div class="row">
+      <select id="dev"></select>
+      <button id="start">开始监听</button>
+      <button id="stop" class="ghost" disabled>停止</button>
+    </div>
+    <div id="meter"><div id="fill"></div><div id="peak"></div></div>
+    <div class="readout">
+      峰值 <b id="r-peak">—</b> · 有效值 <b id="r-rms">—</b> · 电平 <b id="r-db">—</b>
+    </div>
+    <div style="margin-top:14px" class="row">
+      <button id="rec" class="ghost" disabled>录音 5 秒并回放</button>
+      <span id="rec-state" class="readout"></span>
+    </div>
+    <audio id="playback" controls hidden></audio>
+    <div style="margin-top:10px" class="row">
+      <button id="raw" class="ghost" disabled>录制 10 秒原始 PCM 并上传</button>
+      <span id="raw-state" class="readout"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="status" class="state">未开始。授权后设备列表才会出现完整名称。</div>
+    <ol>
+      <li>点「开始监听」，浏览器会请求麦克风权限 —— 选「允许」。</li>
+      <li>在下拉框里选 <b>MI-RC003 Microphone</b>。</li>
+      <li>按住遥控器的<b>语音键</b>，对着遥控器说话，看电平条动不动。</li>
+      <li>松开后点「录音 5 秒并回放」，听一下录到的是不是你的声音。</li>
+      <li>要做客观分析时点「录制 10 秒原始 PCM 并上传」：<b>前 3 秒别出声</b>，
+          然后按住语音键稳定地发「啊——」约 3 秒，松开，最后正常说一句话。</li>
+    </ol>
+  </div>
+</main>
+
+<script>
+"use strict";
+var $ = function (id) { return document.getElementById(id); };
+
+var stream = null, ctx = null, analyser = null, buf = null, raf = 0;
+var peakHold = 0, peakHoldAt = 0;
+
+function setStatus(text, kind) {
+  var el = $("status");
+  el.textContent = text;
+  el.className = "state" + (kind ? " " + kind : "");
+}
+
+function fillDevices() {
+  return navigator.mediaDevices.enumerateDevices().then(function (list) {
+    var inputs = list.filter(function (d) { return d.kind === "audioinput"; });
+    var sel = $("dev");
+    var prev = sel.value;
+    sel.innerHTML = "";
+    inputs.forEach(function (d, i) {
+      var o = document.createElement("option");
+      o.value = d.deviceId;
+      // Before permission is granted the labels are empty strings; fall back to
+      // an index so the list is still usable and obviously unlabelled.
+      o.textContent = d.label || ("输入设备 " + (i + 1) + "（未授权，名称未知）");
+      sel.appendChild(o);
+    });
+    if (prev) sel.value = prev;
+    // Prefer the bridge's microphone when the label is available.
+    for (var i = 0; i < inputs.length; i++) {
+      if ((inputs[i].label || "").indexOf("MI-RC003") >= 0) { sel.value = inputs[i].deviceId; break; }
+    }
+    return inputs;
+  });
+}
+
+function stop() {
+  if (raf) { cancelAnimationFrame(raf); raf = 0; }
+  if (stream) { stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+  if (ctx) { ctx.close(); ctx = null; }
+  analyser = null;
+  $("start").disabled = false;
+  $("stop").disabled = true;
+  $("rec").disabled = true;
+  $("raw").disabled = true;
+  $("fill").style.right = "100%";
+  $("peak").style.left = "0";
+  $("r-peak").textContent = "—"; $("r-rms").textContent = "—"; $("r-db").textContent = "—";
+}
+
+function tick() {
+  raf = requestAnimationFrame(tick);
+  if (!analyser) return;
+  analyser.getFloatTimeDomainData(buf);
+  var peak = 0, sum = 0;
+  for (var i = 0; i < buf.length; i++) {
+    var v = buf[i];
+    if (v < 0) v = -v;
+    if (v > peak) peak = v;
+    sum += buf[i] * buf[i];
+  }
+  var rms = Math.sqrt(sum / buf.length);
+  var now = performance.now();
+  if (peak >= peakHold || now - peakHoldAt > 700) { peakHold = peak; peakHoldAt = now; }
+
+  $("fill").style.right = (100 - Math.min(100, peak * 100)) + "%";
+  $("peak").style.left = Math.min(100, peakHold * 100) + "%";
+  $("r-peak").textContent = peak.toFixed(4);
+  $("r-rms").textContent = rms.toFixed(4);
+  $("r-db").textContent = (peak > 0 ? (20 * Math.log10(peak)).toFixed(1) : "-inf") + " dBFS";
+}
+
+function start() {
+  var id = $("dev").value;
+  var constraints = { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } };
+  if (id) constraints.audio.deviceId = { exact: id };
+  setStatus("正在打开…");
+  navigator.mediaDevices.getUserMedia(constraints).then(function (s) {
+    stream = s;
+    var track = s.getAudioTracks()[0];
+    var settings = track.getSettings ? track.getSettings() : {};
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    var src = ctx.createMediaStreamSource(s);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    buf = new Float32Array(analyser.fftSize);
+    src.connect(analyser);
+    tick();
+    $("start").disabled = true;
+    $("stop").disabled = false;
+    $("rec").disabled = false;
+    $("raw").disabled = false;
+    setStatus("已打开：" + (track.label || "?") + " · " + settings.sampleRate + " Hz · " +
+              settings.channelCount + " 声道 —— 现在按住遥控器语音键说话。", "ok");
+  }).catch(function (e) {
+    setStatus("打开失败：" + (e && e.name ? e.name + " — " + e.message : e), "bad");
+  });
+}
+
+function record() {
+  if (!stream) return;
+  var chunks = [];
+  var mr = new MediaRecorder(stream);
+  mr.ondataavailable = function (e) { if (e.data.size) chunks.push(e.data); };
+  mr.onstop = function () {
+    var blob = new Blob(chunks, { type: mr.mimeType });
+    var url = URL.createObjectURL(blob);
+    var a = $("playback");
+    a.src = url; a.hidden = false;
+    $("rec-state").textContent = "录到 " + blob.size + " 字节 — 按播放试听";
+    $("rec").disabled = false;
+  };
+  mr.start();
+  $("rec").disabled = true;
+  setStatus("录音中：按住语音键说话，5 秒…", "ok");
+  setTimeout(function () { if (mr.state !== "inactive") mr.stop(); }, 5000);
+}
+
+// Raw PCM capture, uploaded for offline measurement.
+//
+// Deliberately NOT MediaRecorder: that re-encodes to Opus, and a lossy codec
+// hides exactly the defects worth looking for (dropouts, band edges, level).
+// This taps the audio graph and writes a plain 16-bit WAV, so what lands on disk
+// is what the host actually received from the bridge.
+var rawState = null;
+
+function encodeWav(chunks, total, rate) {
+  var head = 44;
+  var view = new DataView(new ArrayBuffer(head + total * 2));
+  function str(off, s) { for (var i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); }
+  str(0, "RIFF"); view.setUint32(4, 36 + total * 2, true); str(8, "WAVE");
+  str(12, "fmt "); view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  str(36, "data"); view.setUint32(40, total * 2, true);
+  var off = head;
+  for (var c = 0; c < chunks.length; c++) {
+    var a = chunks[c];
+    for (var i = 0; i < a.length; i++) {
+      var v = Math.max(-1, Math.min(1, a[i]));
+      view.setInt16(off, v < 0 ? v * 0x8000 : v * 0x7FFF, true);
+      off += 2;
+    }
+  }
+  return new Blob([view.buffer], { type: "audio/wav" });
+}
+
+function recordRaw() {
+  if (!stream || !ctx) return;
+  var seconds = 10;
+  var chunks = [];
+  var total = 0;
+
+  var src = ctx.createMediaStreamSource(stream);
+  var proc = ctx.createScriptProcessor(4096, 1, 1);
+  proc.onaudioprocess = function (e) {
+    if (!rawState) return;
+    var d = e.inputBuffer.getChannelData(0);
+    chunks.push(new Float32Array(d));
+    total += d.length;
+  };
+  // A ScriptProcessor only runs while connected. Route it through a zero gain so
+  // the graph stays alive without playing the microphone back into the speakers.
+  var mute = ctx.createGain();
+  mute.gain.value = 0;
+  src.connect(proc);
+  proc.connect(mute);
+  mute.connect(ctx.destination);
+
+  rawState = { src: src, proc: proc, mute: mute };
+  $("raw").disabled = true;
+  $("raw-state").textContent = "录制中…前 3 秒请保持安静";
+  var left = Math.ceil(seconds - 3);
+  var timer = setInterval(function () {
+    $("raw-state").textContent = left > 0
+      ? ("现在按住语音键发「啊——」，还剩 " + left + " 秒")
+      : "最后 1 秒…";
+    left--;
+  }, 1000);
+
+  setTimeout(function () {
+    clearInterval(timer);
+    var st = rawState;
+    rawState = null;
+    if (st) {
+      try { st.proc.disconnect(); st.src.disconnect(); st.mute.disconnect(); } catch (e) {}
+    }
+    var rate = ctx ? ctx.sampleRate : 48000;
+    var blob = encodeWav(chunks, total, rate);
+    $("raw-state").textContent = "上传中… " + (blob.size / 1024).toFixed(0) + " KB";
+    fetch("/upload", { method: "POST", body: blob })
+      .then(function (r) { return r.text(); })
+      .then(function (t) { $("raw-state").textContent = "已上传：" + t; })
+      .catch(function (e) { $("raw-state").textContent = "上传失败：" + e; });
+    $("raw").disabled = false;
+  }, seconds * 1000);
+}
+
+$("start").onclick = start;
+$("stop").onclick = stop;
+$("rec").onclick = record;
+$("raw").onclick = recordRaw;
+$("dev").onchange = function () { if (stream) { stop(); start(); } };
+fillDevices();
+if (navigator.mediaDevices && navigator.mediaDevices.ondevicechange) {
+  navigator.mediaDevices.ondevicechange = fillDevices;
+}
+</script>
+</body>
+</html>

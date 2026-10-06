@@ -46,14 +46,27 @@ const int usb_string_descriptor_count =
 // The serial number must be unique per chip. Windows keys the device instance
 // on VID/PID/serial; a fixed serial makes Windows reuse a stale, incompatible
 // registry entry ("device settings were not migrated", Code 10/28).
-static char s_serial[16];
+//
+// The audio format is part of the serial for the same reason, and it is not
+// cosmetic. Windows caches each capture endpoint's *default format* in the
+// registry, keyed on this device instance, and opens the stream in shared mode
+// at that cached rate. Change the sample rate in the descriptor without changing
+// the serial and Windows keeps asking for the old rate: the device no longer
+// supports it, the host's IAudioClient::Initialize fails, and the application
+// gets NotReadableError - without ever selecting the streaming alternate
+// setting, so the firmware sees nothing at all and reports zero USB reads.
+//
+// Encoding the rate here makes a format change look like new hardware, so the
+// endpoint is rebuilt from the current descriptor instead of the stale cache.
+// Bump nothing by hand: this follows AUDIO_SAMPLE_RATE automatically.
+static char s_serial[24];
 
 void usb_descriptors_init(void)
 {
     uint8_t mac[6] = {0};
     esp_efuse_mac_get_default(mac);
-    snprintf(s_serial, sizeof(s_serial), "%02X%02X%02X%02X%02X%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    snprintf(s_serial, sizeof(s_serial), "%02X%02X%02X%02X%02X%02X-%d",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], AUDIO_SAMPLE_RATE);
     usb_string_descriptors[3] = s_serial;
 }
 
@@ -98,16 +111,29 @@ const uint8_t usb_config_descriptor[] = {
     0x09, 0x24, 0x03, 0x03, 0x01, 0x01, 0x00, 0x02, 0x00,
     // 7. Standard AS interface, alt 0 (zero bandwidth)
     0x09, 0x04, USB_ITF_UAC_AS, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00,
-    // 8. Standard AS interface, alt 1 (active, 16 kHz)
+    // 8. Standard AS interface, alt 1 (active)
     0x09, 0x04, USB_ITF_UAC_AS, 0x01, 0x01, 0x01, 0x02, 0x00, 0x00,
     // 9. CS AS general
     0x07, 0x24, 0x01, 0x03, 0x01, 0x01, 0x00,
-    // 10. Format type I (16 kHz, 16-bit, mono)
-    0x0B, 0x24, 0x02, 0x01, 0x01, 0x02, 0x10, 0x01, 0x80, 0x3E, 0x00,
-    // 11. Isochronous IN endpoint (64 bytes / 32 samples, bInterval = 2 ms).
-    //     64 B / 2 ms = 32 kB/s = 16 kHz mono 16-bit, and the 2 ms bInterval
-    //     avoids the ESP32-S3 DWC2 even/odd frame-boundary bug.
-    0x09, 0x05, USB_EP_UAC_IN, 0x05, 0x40, 0x00, 0x02, 0x00, 0x00,
+    // 10. Format type I: AUDIO_SAMPLE_RATE, 16-bit, mono. The three sample-rate
+    //     bytes are little endian, derived from the active sample rate so the
+    //     descriptor can never disagree with what the DSP actually produces.
+    0x0B, 0x24, 0x02, 0x01, 0x01, 0x02, 0x10, 0x01,
+    (uint8_t)(AUDIO_SAMPLE_RATE & 0xFF),
+    (uint8_t)((AUDIO_SAMPLE_RATE >> 8) & 0xFF),
+    (uint8_t)((AUDIO_SAMPLE_RATE >> 16) & 0xFF),
+    // 11. Isochronous IN endpoint, bInterval = 2 ms.
+    //     The ESP32-S3 DWC2 even/odd frame-boundary bug means queuing
+    //     isochronous IN transfers on a 1 ms cadence makes the controller skip
+    //     every other frame, halving the effective rate; 2 ms leaves a whole
+    //     frame of slack. USB_UAC_PACKET_BYTES is exactly 2 ms of mono 16-bit
+    //     audio at AUDIO_SAMPLE_RATE, which is what the host's bandwidth check
+    //     requires (64 B / 2 ms = 32 kB/s at 16 kHz, 32 B / 2 ms = 16 kB/s at
+    //     8 kHz).
+    0x09, 0x05, USB_EP_UAC_IN, 0x05,
+    (uint8_t)(USB_UAC_PACKET_BYTES & 0xFF),
+    (uint8_t)((USB_UAC_PACKET_BYTES >> 8) & 0xFF),
+    0x02, 0x00, 0x00,
     // 12. CS endpoint general
     0x07, 0x25, 0x01, 0x00, 0x00, 0x00, 0x00,
 

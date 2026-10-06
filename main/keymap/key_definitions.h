@@ -31,6 +31,54 @@ extern "C" {
 #define MI_KEY_VOICE_ALT    0x3E    // Voice button (HID usage F5)
 
 // ==========================================
+// 1b. Google TV Remote (G20BTS / G9N9N) key codes
+//
+// The Google TV Remote does not send HID keyboard usages. Its HOGP input
+// report is a 1-byte button index delivered as `[index 00]` (2 bytes) and
+// occasionally `[index 00 00 00 00 00]` (6 bytes), with an all-zero report on
+// release. The index is positional and follows the standard Google TV remote
+// button list, in the same order as PHYSICAL_KEYS in the WebUSB config site, so
+// the canonical codes below are also the source_vk values used by the key map:
+//
+//   index 1  Power          | 2  Google Assistant (mic) | 3  D-Pad Up
+//   index 4  D-Pad Down     | 5  D-Pad Left             | 6  D-Pad Right
+//   index 7  Select (OK)    | 8  Back                   | 9  Home
+//   index 10 Menu           | 11 Volume +               | 12 Volume -
+//   index 13 Input (source select)
+//
+// Every one of these indices was confirmed against a real remote: each was
+// observed in the device log together with the key it produced.
+//
+// Indices 14..16 are reserved for the mute and preset-app buttons (YouTube /
+// Netflix and similar) that some variants carry. They stay unmapped until a
+// unit reports them, and an unrecognised index is logged with its raw bytes
+// rather than being guessed at.
+// ==========================================
+#define MI_KEY_GTV_POWER        0x70
+#define MI_KEY_GTV_VOICE        0x71
+#define MI_KEY_GTV_UP           0x72
+#define MI_KEY_GTV_DOWN         0x73
+#define MI_KEY_GTV_LEFT         0x74
+#define MI_KEY_GTV_RIGHT        0x75
+#define MI_KEY_GTV_OK           0x76
+#define MI_KEY_GTV_BACK         0x77
+#define MI_KEY_GTV_HOME         0x78
+#define MI_KEY_GTV_MENU         0x79
+#define MI_KEY_GTV_VOL_UP       0x7A
+#define MI_KEY_GTV_VOL_DOWN     0x7B
+#define MI_KEY_GTV_INPUT        0x7C
+#define MI_KEY_GTV_MUTE         0x7D
+#define MI_KEY_GTV_APP_1        0x7E
+#define MI_KEY_GTV_APP_2        0x7F
+
+// Index 13 is the input-source key on the standard button list. The earlier
+// name called it the TV key, which is why it used to send F8.
+#define MI_KEY_GTV_TV           MI_KEY_GTV_INPUT
+
+// Highest button index the Google TV Remote layout can report.
+#define MI_KEY_GTV_INDEX_MAX    16
+
+// ==========================================
 // 2. USB HID Keyboard Modifier Bitmasks
 // ==========================================
 #define USB_MOD_NONE        0x00
@@ -50,6 +98,7 @@ extern "C" {
 #define USB_KEY_A           0x04
 #define USB_KEY_D           0x07    // 'D' (Win+D show desktop)
 #define USB_KEY_H           0x0B    // 'H' (Win+H voice typing)
+#define USB_KEY_N           0x11    // 'N' (Win+N notification centre, Netflix)
 #define USB_KEY_RETURN      0x28    // Enter
 #define USB_KEY_ESCAPE      0x29    // Esc
 #define USB_KEY_BACKSPACE   0x2A
@@ -77,6 +126,7 @@ extern "C" {
 #define USB_CONSUMER_PREV_TRACK     0x00B6
 #define USB_CONSUMER_AC_HOME        0x0223
 #define USB_CONSUMER_AC_BACK        0x0224
+#define USB_CONSUMER_AC_SEARCH      0x0221  // search / source select
 
 // ==========================================
 // 5. USB HID Mouse Button Bitmasks

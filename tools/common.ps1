@@ -225,7 +225,7 @@ function New-WebFlashFiles([string]$Version, [System.Collections.IDictionary]$Me
         Copy-BinFile $MergedBins[$prof] (Join-Path $fwDir $binName)
 
         $manifest = [ordered]@{
-            name                     = 'MI-RC003 Bridge ' + $info.Label
+            name                     = 'ESP32 BLE Remote Bridge ' + $info.Label
             version                  = $Version
             new_install_prompt_erase = $true
             builds                   = @(
@@ -252,7 +252,7 @@ function New-WebFlashFiles([string]$Version, [System.Collections.IDictionary]$Me
     Copy-BinFile $MergedBins[$primary] (Join-Path $fwDir 'merged-flash.bin')
     $primaryInfo = Get-ProfileInfo $primary
     $defaultManifest = [ordered]@{
-        name                     = 'MI-RC003 Bridge ' + $primaryInfo.Label
+        name                     = 'ESP32 BLE Remote Bridge ' + $primaryInfo.Label
         version                  = $Version
         new_install_prompt_erase = $true
         builds                   = @(

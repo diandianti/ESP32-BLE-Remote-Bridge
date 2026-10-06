@@ -4,15 +4,15 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#fbfbfd" />
-  <title>MI-RC003 Bridge - WebUSB 配置中心</title>
-  <link rel="stylesheet" href="assets/style.css?v=40" />
+  <title>ESP32 BLE Remote Bridge - WebUSB 配置中心</title>
+  <link rel="stylesheet" href="assets/style.css?v=43" />
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
       <div>
-        <h1>MI-RC003 Bridge 配置中心</h1>
-        <p class="subtitle">小米蓝牙遥控器 2 Pro (RC003) · ESP32-S3 · WebUSB · <span id="hdr-version">固件 -</span> · <span id="webui-version">WebUI -</span></p>
+        <h1>ESP32 BLE Remote Bridge 配置中心</h1>
+        <p class="subtitle">ESP32 BLE Remote Bridge · 小米蓝牙遥控器 2 Pro (RC003) / Google TV Remote · ESP32-S3 · WebUSB · <span id="hdr-version">固件 -</span> · <span id="webui-version">WebUI -</span></p>
       </div>
     </div>
     <div class="conn">
@@ -32,6 +32,7 @@
     <nav class="tabs">
       <button class="tab active" data-tab="status">设备状态</button>
       <button class="tab" data-tab="keymap">按键配置</button>
+      <button class="tab" data-tab="learn">按键学习</button>
       <button class="tab" data-tab="ble">蓝牙配对</button>
       <button class="tab" data-tab="logs">运行日志</button>
       <button class="tab" data-tab="system">系统设置</button>
@@ -92,6 +93,68 @@
       </div>
       <div id="keymap-grid" class="keymap-grid"></div>
       <p class="remote-info" id="remote-info">将鼠标移到按键上查看映射</p>
+    </section>
+
+    <!-- ================= 按键学习 ================= -->
+    <section class="panel" id="panel-learn">
+      <div class="card">
+        <h3>怎么用</h3>
+        <p class="hint">
+          按一下遥控器上的按键 → 下面的读数会立刻显示它是第几个「物理槽位」→ 在表格里给这一行起个名字 → 点「保存名称」。<br />
+          名字<b>只影响显示</b>，让你自己看得懂哪个槽位对应遥控器上的哪个键；这个槽位实际发出什么按键，请到「按键配置」里改。<br />
+          遥控器型号不同，出厂猜的默认名字可能和实际按键对不上，这时以实测为准：<b>按下哪个键，亮起来的行就是它</b>。<br />
+          遥控器上报按键用的是<b>「索引」</b>，而索引只在<b>同一条 HID 报告内</b>唯一：像 Google TV Remote (ZTKA-IR57) 就有主、副两条报告，主报告的索引 1 是「方向上」，副报告的索引 1 却是「音量+」，所以索引本身并不能唯一确定一个按键，也不能换算成槽位。真正稳定的身份是这里的<b>槽位</b> —— 页面显示的槽位来自固件对上报键码的规范化结果，永远和「按键配置」里的那一行对应。想看原始索引，请到「运行日志」页打开 <b>raw report</b>，日志会按行打印 <code>HOGP: button chr#N idx=M -> key 0xXX (name) DOWN</code>（<code>chr#N</code> 是报告通道，<code>idx=M</code> 是它在那条报告里的索引）。
+        </p>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>实时检测</h3>
+          <label class="check"><input type="checkbox" id="learn-live" checked /> 实时监听</label>
+        </div>
+        <div class="learn-stage">
+          <div class="learn-readout" id="learn-readout">
+            <span class="learn-state" id="learn-state">等待按键</span>
+            <span class="learn-name" id="learn-name">—</span>
+            <span class="learn-slot" id="learn-slot">槽位 —</span>
+          </div>
+          <div class="learn-chips">
+            <span class="chip">槽位 <b id="learn-slot-idx">-</b></span>
+            <span class="chip">原始码 <b id="learn-vk">-</b></span>
+            <span class="chip">按住时长 <b id="learn-duration">-</b></span>
+          </div>
+        </div>
+        <p class="hint" id="learn-tip">按一下遥控器上的任意按键开始。若长时间没有反应，请到「蓝牙配对」确认遥控器已连接。</p>
+        <div class="learn-history-wrap">
+          <span class="learn-history-label">最近按下</span>
+          <div class="learn-history" id="learn-history"><span class="learn-empty">暂无</span></div>
+          <button id="btn-learn-clear" class="btn small">清空</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>按键名称</h3>
+          <div class="row">
+            <button id="btn-learn-save" class="btn small primary">保存名称</button>
+            <button id="btn-learn-reset" class="btn small danger">全部恢复默认</button>
+          </div>
+        </div>
+        <p class="hint">
+          想确认某一行对应遥控器上的哪个键：先点这一行的「检测」，再按下你怀疑的那个键 —— 该行会闪烁，
+          说明它就是刚才那个键。点「去映射」可直接跳到「按键配置」里改这个槽位的动作。<br />
+          名称按 <b>UTF-8 字节</b>计算，最多 <b>31 字节</b>（约 10 个汉字 / 31 个字母），超出部分会被截断。留空即恢复默认名称。
+        </p>
+        <p class="hint hidden" id="learn-names-note"></p>
+        <div class="table-wrap">
+          <table class="learn-table">
+            <thead>
+              <tr><th style="width:64px">槽位</th><th style="width:150px">默认名称</th><th>自定义名称</th><th style="width:170px"></th></tr>
+            </thead>
+            <tbody id="learn-rows"></tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <!-- ================= 蓝牙 ================= -->
@@ -202,7 +265,7 @@
     </div>
   </div>
 
-  <script src="assets/mi-rc003.js?v=9"></script>
-  <script src="assets/app.js?v=55"></script>
+  <script src="assets/mi-rc003.js?v=11"></script>
+  <script src="assets/app.js?v=58"></script>
 </body>
 </html>

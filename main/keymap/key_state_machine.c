@@ -30,7 +30,6 @@ static uint8_t  s_tv_rapid_count = 0;
 static uint32_t s_tv_rapid_first_ms = 0;
 
 extern void led_indicator_set_switch_mode(bool active);
-extern void key_config_storage_request_save(void);
 
 void key_engine_lock(void)
 {
@@ -68,6 +67,26 @@ static int get_physical_key_slot(uint8_t raw_key)
         case MI_KEY_VOL_UP:   return 10;
         case MI_KEY_VOL_DOWN: return 11;
         case MI_KEY_TV: case MI_KEY_TV_ALT: return 12;
+        // Google TV Remote reports button indices natively, so the canonical
+        // codes already carry the physical slot (index - 1).
+        case MI_KEY_GTV_POWER:    return 0;
+        case MI_KEY_GTV_VOICE:    return 1;
+        case MI_KEY_GTV_UP:       return 2;
+        case MI_KEY_GTV_DOWN:     return 3;
+        case MI_KEY_GTV_LEFT:     return 4;
+        case MI_KEY_GTV_RIGHT:    return 5;
+        case MI_KEY_GTV_OK:       return 6;
+        case MI_KEY_GTV_BACK:     return 7;
+        case MI_KEY_GTV_HOME:     return 8;
+        case MI_KEY_GTV_MENU:     return 9;
+        case MI_KEY_GTV_VOL_UP:   return 10;
+        case MI_KEY_GTV_VOL_DOWN: return 11;
+        case MI_KEY_GTV_INPUT:    return 12;
+        // Mute and the preset-app buttons sit past the 13-key layout, so they
+        // get their own gesture slots rather than aliasing an existing key.
+        case MI_KEY_GTV_MUTE:     return 13;
+        case MI_KEY_GTV_APP_1:    return 14;
+        case MI_KEY_GTV_APP_2:    return 15;
         default: return -1;
     }
 }
@@ -80,6 +99,21 @@ static uint8_t canonical_source_vk(uint8_t raw_key)
         case MI_KEY_HOME_ALT:  return MI_KEY_HOME;
         case MI_KEY_MENU_ALT:  return MI_KEY_MENU;
         case MI_KEY_TV_ALT:    return MI_KEY_TV;
+        // Google TV indices arrive canonically; map them onto the shared
+        // semantic codes so a single default key map covers both remotes.
+        case MI_KEY_GTV_POWER:    return MI_KEY_POWER;
+        case MI_KEY_GTV_VOICE:    return MI_KEY_VOICE;
+        case MI_KEY_GTV_UP:       return MI_KEY_UP;
+        case MI_KEY_GTV_DOWN:     return MI_KEY_DOWN;
+        case MI_KEY_GTV_LEFT:     return MI_KEY_LEFT;
+        case MI_KEY_GTV_RIGHT:    return MI_KEY_RIGHT;
+        case MI_KEY_GTV_OK:       return MI_KEY_OK;
+        case MI_KEY_GTV_BACK:     return MI_KEY_BACK;
+        case MI_KEY_GTV_HOME:     return MI_KEY_HOME;
+        case MI_KEY_GTV_MENU:     return MI_KEY_MENU;
+        case MI_KEY_GTV_VOL_UP:   return MI_KEY_VOL_UP;
+        case MI_KEY_GTV_VOL_DOWN: return MI_KEY_VOL_DOWN;
+        case MI_KEY_GTV_INPUT:    return MI_KEY_TV;
         default: return raw_key;
     }
 }
@@ -242,10 +276,10 @@ void key_engine_switch_layer(key_mapper_engine_t *engine, uint8_t target_layer, 
     led_indicator_set_layer_color(engine->layers[target_layer].led_color);
     app_log("KEYMAP", "Layer Switched -> [%u: %s]", target_layer, engine->layers[target_layer].name);
 
-    // Persist the selection so a device-side switch (configuration-switch mode,
-    // ACTION_SWITCH_LAYER, WebUSB set-layer) survives a reboot instead of
-    // reverting to the last layer written by a keymap save.
-    key_config_storage_request_save();
+    // The selection is intentionally NOT persisted. Which layer is active is
+    // runtime state, and with the switch map bound to the D-pad, switching is a
+    // routine keypress - persisting it meant a flash write per keypress. A reboot
+    // starts on layer 0; only configuration changes ever reach flash.
 }
 
 void key_engine_enter_switch_mode(key_mapper_engine_t *engine, uint32_t now_ms, bool via_tv_rapid)
@@ -331,7 +365,9 @@ void key_engine_load_defaults(key_mapper_engine_t *engine)
     l0->led_color = 0x00FF00;
     l0->binding_count = 0;
 
-    // Power: click Alt+Tab, long Sleep
+    // Power: click Alt+Tab (task switch), long-press system sleep. A power
+    // button has no host-side meaning for a USB keyboard, so the useful
+    // interpretation is a window-switch on tap and sleep on hold.
     {
         key_binding_t b;
         memset(&b, 0, sizeof(b));
@@ -447,16 +483,47 @@ void key_engine_load_defaults(key_mapper_engine_t *engine)
         b.repeat_interval_ms = 70;
         l0->bindings[l0->binding_count++] = b;
     }
-    // TV -> F8 (short), long-press enters the configuration switch mode
+    // Input (source select): a search prompt is the closest host-side meaning,
+    // so it opens the app/file search box. Long-press enters the configuration
+    // switch mode, which is the only way to change layers without the web page.
     {
         key_binding_t b;
         memset(&b, 0, sizeof(b));
         b.source_vk = MI_KEY_TV;
         b.has_click = true;
-        b.click_action = (key_action_t){ ACTION_KEYBOARD_TAP, USB_MOD_NONE, USB_KEY_F8, 0, 0, 0, 0, 0 };
+        b.click_action = (key_action_t){ ACTION_CONSUMER_TAP, USB_MOD_NONE, USB_KEY_NONE, USB_CONSUMER_AC_SEARCH, 0, 0, 0, 0 };
         b.has_long = true;
         b.long_ms = 600;
         b.long_action = (key_action_t){ ACTION_ENTER_SWITCH_MODE, 0, 0, 0, 0, 0, 0, 0 };
+        l0->bindings[l0->binding_count++] = b;
+    }
+    // Mute, and the preset app buttons. Only present on some variants; a unit
+    // that lacks them simply never reports these codes.
+    {
+        key_binding_t b;
+        memset(&b, 0, sizeof(b));
+        b.source_vk = MI_KEY_GTV_MUTE;
+        b.has_click = true;
+        b.click_action = (key_action_t){ ACTION_CONSUMER_TAP, USB_MOD_NONE, USB_KEY_NONE, USB_CONSUMER_MUTE, 0, 0, 0, 0 };
+        l0->bindings[l0->binding_count++] = b;
+    }
+    // Preset app 1 -> Windows notification centre is not useful; use the
+    // browser-era convention of a plain media-play tap instead, which every
+    // video site understands.
+    {
+        key_binding_t b;
+        memset(&b, 0, sizeof(b));
+        b.source_vk = MI_KEY_GTV_APP_1;
+        b.has_click = true;
+        b.click_action = (key_action_t){ ACTION_CONSUMER_TAP, USB_MOD_NONE, USB_KEY_NONE, USB_CONSUMER_PLAY_PAUSE, 0, 0, 0, 0 };
+        l0->bindings[l0->binding_count++] = b;
+    }
+    {
+        key_binding_t b;
+        memset(&b, 0, sizeof(b));
+        b.source_vk = MI_KEY_GTV_APP_2;
+        b.has_click = true;
+        b.click_action = (key_action_t){ ACTION_CONSUMER_TAP, USB_MOD_NONE, USB_KEY_NONE, USB_CONSUMER_NEXT_TRACK, 0, 0, 0, 0 };
         l0->bindings[l0->binding_count++] = b;
     }
 
@@ -745,6 +812,33 @@ void key_engine_feed_key(key_mapper_engine_t *engine, uint8_t raw_key_code, bool
     key_engine_unlock();
 }
 
+// Physical slot -> canonical key code, indexed by slot. This is the single
+// source of truth for the slot numbering: get_physical_key_slot() assigns these
+// slot numbers, and the tick, release-all and telemetry paths all read the slot
+// back through this table. Keeping one copy means adding a button cannot leave
+// one of the three paths behind (previously each had its own array and a
+// hard-coded count of 13, which silently excluded any higher slot).
+static const uint8_t k_slot_keys[] = {
+    MI_KEY_POWER,           // 0
+    MI_KEY_VOICE,           // 1
+    MI_KEY_UP,              // 2
+    MI_KEY_DOWN,            // 3
+    MI_KEY_LEFT,            // 4
+    MI_KEY_RIGHT,           // 5
+    MI_KEY_OK,              // 6
+    MI_KEY_BACK,            // 7
+    MI_KEY_HOME,            // 8
+    MI_KEY_MENU,            // 9
+    MI_KEY_VOL_UP,          // 10
+    MI_KEY_VOL_DOWN,        // 11
+    MI_KEY_TV,              // 12  (input / source select)
+    MI_KEY_GTV_MUTE,        // 13
+    MI_KEY_GTV_APP_1,       // 14
+    MI_KEY_GTV_APP_2,       // 15
+};
+
+#define KEY_SLOT_COUNT ((int)(sizeof(k_slot_keys) / sizeof(k_slot_keys[0])))
+
 void key_engine_tick(key_mapper_engine_t *engine, uint32_t now_ms)
 {
     if (!engine) return;
@@ -770,17 +864,11 @@ void key_engine_tick(key_mapper_engine_t *engine, uint32_t now_ms)
         }
     }
 
-    uint8_t raw_keys[] = {
-        MI_KEY_POWER, MI_KEY_VOICE, MI_KEY_UP, MI_KEY_DOWN,
-        MI_KEY_LEFT, MI_KEY_RIGHT, MI_KEY_OK, MI_KEY_BACK,
-        MI_KEY_HOME, MI_KEY_MENU, MI_KEY_VOL_UP, MI_KEY_VOL_DOWN, MI_KEY_TV
-    };
-
-    for (int slot = 0; slot < 13; slot++) {
+    for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
         key_slot_state_t *s = &engine->states[slot];
         if (!s->is_pressed && !s->waiting_double) continue;
 
-        uint8_t raw_key = raw_keys[slot];
+        uint8_t raw_key = k_slot_keys[slot];
         key_binding_t b;
         get_effective_binding(engine, raw_key, &b);
 
@@ -812,17 +900,12 @@ void key_engine_tick(key_mapper_engine_t *engine, uint32_t now_ms)
 
 uint8_t key_engine_get_pressed_vk(const key_mapper_engine_t *engine)
 {
-    static const uint8_t raw_keys[] = {
-        MI_KEY_POWER, MI_KEY_VOICE, MI_KEY_UP, MI_KEY_DOWN,
-        MI_KEY_LEFT, MI_KEY_RIGHT, MI_KEY_OK, MI_KEY_BACK,
-        MI_KEY_HOME, MI_KEY_MENU, MI_KEY_VOL_UP, MI_KEY_VOL_DOWN, MI_KEY_TV
-    };
     uint8_t vk = 0;
     if (!engine) return 0;
     key_engine_lock();
-    for (int slot = 0; slot < 13; slot++) {
+    for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
         if (engine->states[slot].is_pressed) {
-            vk = raw_keys[slot];
+            vk = k_slot_keys[slot];
             break;
         }
     }
@@ -830,21 +913,43 @@ uint8_t key_engine_get_pressed_vk(const key_mapper_engine_t *engine)
     return vk;
 }
 
+int key_engine_slot_count(void)
+{
+    return KEY_SLOT_COUNT;
+}
+
+uint8_t key_engine_vk_for_slot(int slot)
+{
+    if (slot < 0 || slot >= KEY_SLOT_COUNT) return 0;
+    return k_slot_keys[slot];
+}
+
+int key_engine_slot_for_vk(uint8_t vk)
+{
+    for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
+        if (k_slot_keys[slot] == vk) return slot;
+    }
+
+    // A Google TV Remote reports its own codes, and those carry the slot
+    // directly (slot = code - MI_KEY_GTV_POWER). They have to resolve here too,
+    // because a caller holding a raw report never sees the canonical code the
+    // table above stores. Mute / app1 / app2 are in both tables and were
+    // already matched by the loop, so only the first thirteen reach this path.
+    if (vk >= MI_KEY_GTV_POWER && vk <= MI_KEY_GTV_APP_2) {
+        return (int)(vk - MI_KEY_GTV_POWER);
+    }
+    return -1;
+}
+
 void key_engine_release_all(key_mapper_engine_t *engine, uint32_t now_ms)
 {
     if (!engine) return;
     key_engine_lock();
 
-    uint8_t raw_keys[] = {
-        MI_KEY_POWER, MI_KEY_VOICE, MI_KEY_UP, MI_KEY_DOWN,
-        MI_KEY_LEFT, MI_KEY_RIGHT, MI_KEY_OK, MI_KEY_BACK,
-        MI_KEY_HOME, MI_KEY_MENU, MI_KEY_VOL_UP, MI_KEY_VOL_DOWN, MI_KEY_TV
-    };
-
-    for (int slot = 0; slot < 13; slot++) {
+    for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
         key_slot_state_t *s = &engine->states[slot];
         if (s->is_pressed) {
-            key_engine_feed_key(engine, raw_keys[slot], false, now_ms);
+            key_engine_feed_key(engine, k_slot_keys[slot], false, now_ms);
         }
         s->waiting_double = false;
         s->press_count = 0;

@@ -59,15 +59,16 @@ size_t audio_pipeline_feed_adpcm(audio_pipeline_t *pipeline, const uint8_t *adpc
     if (!pipeline || !adpcm_bytes || len == 0 || !pipeline->active) return 0;
 
     // A BLE notification may carry more than one ATVV frame. Decode in bounded
-    // 120-byte chunks so temp_pcm can never overflow, and so the decoder state
-    // stays in lock-step with the remote's frame boundaries.
+    // chunks so temp_pcm can never overflow, and so the decoder state stays in
+    // lock-step with the remote's frame boundaries (128 encoded bytes = 256
+    // PCM samples per ATVV frame).
     size_t total_written = 0;
     size_t offset = 0;
 
     while (offset < len) {
         size_t chunk = len - offset;
-        if (chunk > AUDIO_DEFAULT_FRAME_BYTES) {
-            chunk = AUDIO_DEFAULT_FRAME_BYTES;
+        if (chunk > AUDIO_MAX_CHUNK_BYTES) {
+            chunk = AUDIO_MAX_CHUNK_BYTES;
         }
 
         size_t samples_decoded = adpcm_decode_frame(&pipeline->adpcm,
@@ -77,13 +78,36 @@ size_t audio_pipeline_feed_adpcm(audio_pipeline_t *pipeline, const uint8_t *adpc
         offset += chunk;
         if (samples_decoded == 0) continue;
 
-        // 1. Declip (single-sample spike eliminator)
-        audio_filter_declip(&pipeline->filter, pipeline->temp_pcm, samples_decoded, DECLIP_THRESHOLD);
+        // 1. (removed) Declip.
+        //
+        // audio_filter_declip() was a same-side-neighbour spike replacer with no
+        // absolute-magnitude guard: its gate fires whenever |step| exceeds the
+        // threshold in both directions and the neighbours sit closer to each
+        // other than to the sample, which for a signal of any real amplitude is
+        // "nearly always". Measured on clean tones it rewrote 12.5-50% of
+        // samples, and at exactly fs/4 (2 kHz at 8 kHz) it is degenerate - the
+        // peak samples land on [0, A, 0, -A], so prev == next and the
+        // replacement equals them - nulling the tone to -36 dB at every
+        // amplitude. On speech it costs dB across the band and injects energy
+        // where there was none. The stream is IMA-ADPCM, which cannot contain
+        // impulsive spikes in the first place, so there was nothing to repair.
+        //
+        // 2. (removed) 3-tap low-pass [0.25, 0.5, 0.25].
+        //
+        // Its response is cos^2(pi*f/fs): -3 dB at 1454 Hz, -10 dB at 2.5 kHz,
+        // -25 dB at 3.4 kHz and a hard zero at 4 kHz. At an 8 kHz sample rate
+        // speech carries its consonants in 2-4 kHz, so the filter deleted
+        // exactly the band that carries the most recognition information. It
+        // also cannot reduce noise: an 8 kHz stream is already band-limited to
+        // 4 kHz, so codec and microphone noise share the speech band and no
+        // in-band filter can separate them.
+        //
+        // If hiss ever needs suppressing it has to be a real FIR with a cutoff
+        // near 3.6 kHz, not a 3-tap. A one-pole "y += (x - y) >> 3" is NOT a
+        // mild filter: with a = 1/8 its corner is about 159 Hz at 8 kHz, which
+        // would remove nearly all of the speech.
 
-        // 2. 3-tap triangle FIR low-pass [0.25, 0.5, 0.25]
-        audio_filter_lowpass(&pipeline->filter, pipeline->temp_pcm, samples_decoded);
-
-        // 3. DC blocker (~80 Hz high-pass)
+        // 3. DC blocker (~19 Hz high-pass at 8 kHz)
         audio_filter_dc_block(&pipeline->filter, pipeline->temp_pcm, samples_decoded);
 
         // 4. Dynamic AGC + soft clip. During the lead-mute window feed zeros so the
@@ -163,9 +187,20 @@ size_t audio_pipeline_read_for_usb(audio_pipeline_t *pipeline, int16_t *out_pcm,
 void audio_pipeline_stop_session(audio_pipeline_t *pipeline)
 {
     if (!pipeline) return;
-    if (pipeline->underrun_count > 0) {
-        app_log("AUDIO", "Session ended with %lu underrun(s)", (unsigned long)pipeline->underrun_count);
-    }
+
+    // Session summary. Split deliberately into what the decoder produced
+    // (peak_out, queued) and what USB actually consumed (usb_reads): a silent
+    // microphone is either "no PCM was decoded" or "the host never opened the
+    // stream", and those need opposite fixes. peak_out == 0 with queued > 0
+    // means the samples were decoded but all zero; usb_reads == 0 means the
+    // isochronous endpoint never ran, i.e. the host has not started capture.
+    app_log("AUDIO", "Session: blocks=%lu queued=%lu peak_in=%u peak_out=%u usb_reads=%lu underrun=%lu still_buffering=%d",
+            (unsigned long)pipeline->total_frames_decoded,
+            (unsigned long)pipeline->total_samples_pushed,
+            (unsigned)pipeline->session_peak_in, (unsigned)pipeline->session_peak_out,
+            (unsigned long)pipeline->usb_reads, (unsigned long)pipeline->underrun_count,
+            pipeline->buffering ? 1 : 0);
+
     pipeline->active = false;
     pipeline->buffering = false;
     pipeline->lead_mute_remaining = 0;

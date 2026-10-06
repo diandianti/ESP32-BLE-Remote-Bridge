@@ -125,3 +125,29 @@ esp_err_t config_store_erase_all(void)
 {
     return nvs_flash_erase();
 }
+
+// Entry usage of the NVS partition, as a wear-pressure gauge.
+//
+// Deliberately partition-level rather than a counter inside this module: a
+// counter here would only see writes made through this file, and the bond store
+// (CONFIG_BT_NIMBLE_NVS_PERSIST) writes to NVS directly through the NimBLE host.
+// used_entries grows with every write no matter who made it, so if it stays flat
+// during normal use, nothing is touching flash.
+bool config_store_get_usage(uint32_t *used, uint32_t *free_entries, uint32_t *total)
+{
+    nvs_stats_t st = {0};
+    if (nvs_get_stats(NULL, &st) != ESP_OK) return false;
+    if (used)         *used = (uint32_t)st.used_entries;
+    if (free_entries) *free_entries = (uint32_t)st.free_entries;
+    if (total)        *total = (uint32_t)st.total_entries;
+    return true;
+}
+
+void config_store_log_usage(const char *tag)
+{
+    uint32_t used = 0, free_entries = 0, total = 0;
+    if (config_store_get_usage(&used, &free_entries, &total)) {
+        ESP_LOGI(TAG, "%s used=%u free=%u total=%u entries",
+                 tag ? tag : "", (unsigned)used, (unsigned)free_entries, (unsigned)total);
+    }
+}
