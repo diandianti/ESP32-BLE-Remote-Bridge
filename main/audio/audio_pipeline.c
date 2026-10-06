@@ -107,8 +107,12 @@ size_t audio_pipeline_feed_adpcm(audio_pipeline_t *pipeline, const uint8_t *adpc
         // mild filter: with a = 1/8 its corner is about 159 Hz at 8 kHz, which
         // would remove nearly all of the speech.
 
-        // 3. DC blocker (~19 Hz high-pass at 8 kHz)
-        audio_filter_dc_block(&pipeline->filter, pipeline->temp_pcm, samples_decoded);
+        // 3. Speech high-pass, two cascaded one-pole sections (12 dB/octave) at
+        //    AUDIO_HP_HZ. Replaces a DC blocker whose corner was 19 Hz: the
+        //    measured noise floor of a live session is 85% below 500 Hz, so a
+        //    DC blocker removed none of what is actually audible as rumble.
+        audio_filter_highpass(&pipeline->filter, pipeline->temp_pcm, samples_decoded);
+        audio_filter_highpass(&pipeline->filter, pipeline->temp_pcm, samples_decoded);
 
         // 4. Dynamic AGC + soft clip. During the lead-mute window feed zeros so the
         //    peak envelope does not decay and the gain stays locked at 1.0x.

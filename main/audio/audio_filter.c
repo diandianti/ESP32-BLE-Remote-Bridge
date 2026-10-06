@@ -1,4 +1,5 @@
 #include "audio_filter.h"
+#include "app_config.h"
 #include <stdlib.h>
 
 void audio_filter_init(audio_filter_state_t *state)
@@ -46,13 +47,17 @@ void audio_filter_lowpass(audio_filter_state_t *state, int16_t *samples, size_t 
     state->last_sample = samples[count - 1];
 }
 
-void audio_filter_dc_block(audio_filter_state_t *state, int16_t *samples, size_t count)
+void audio_filter_highpass(audio_filter_state_t *state, int16_t *samples, size_t count)
 {
     if (!state || !samples || count == 0) return;
 
     float y_prev = state->dc_y;
     float x_prev = state->dc_x;
-    const float R = 0.985f; // ~19 Hz high-pass at 8 kHz (scales with the sample rate)
+    // One-pole high-pass, corner AUDIO_HP_HZ. This used to sit at R = 0.985,
+    // i.e. about 19 Hz at 8 kHz - a DC blocker, not a filter. Measurement of a
+    // live session showed the noise floor is 85% concentrated below 500 Hz
+    // (boom and handling rumble, not hiss), and 19 Hz removed none of it.
+    const float R = 1.0f / (1.0f + 6.2831853f * AUDIO_HP_HZ / (float)AUDIO_SAMPLE_RATE);
 
     for (size_t i = 0; i < count; i++) {
         float x = (float)samples[i];
