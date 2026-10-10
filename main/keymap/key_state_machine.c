@@ -346,6 +346,10 @@ void key_engine_load_defaults(key_mapper_engine_t *engine)
     engine->switch_mode_via_tv_rapid = false;
     engine->config_rev++;
 
+    engine->voice.trigger = VOICE_TRIGGER_TOGGLE;
+    engine->voice.hotkey_mode = VOICE_HOTKEY_HOLD;
+    engine->voice.max_sec = 120;
+
     // Default configuration-switch map: only the four directions are
     // user-editable; the confirm key is locked to the default configuration
     // in the engine.
@@ -599,6 +603,16 @@ bool key_engine_set_binding(key_mapper_engine_t *engine, const key_binding_t *bi
 bool key_engine_get_binding(const key_mapper_engine_t *engine, uint8_t source_vk, key_binding_t *out_binding)
 {
     return key_engine_get_layer_binding(engine, 0, source_vk, out_binding);
+}
+
+key_voice_config_t key_engine_get_voice_config(const key_mapper_engine_t *engine)
+{
+    key_voice_config_t v = { VOICE_TRIGGER_TOGGLE, VOICE_HOTKEY_HOLD, 0 };
+    if (!engine) return v;
+    key_engine_lock();
+    v = engine->voice;
+    key_engine_unlock();
+    return v;
 }
 
 void key_engine_init(key_mapper_engine_t *engine, key_output_callback_t cb)

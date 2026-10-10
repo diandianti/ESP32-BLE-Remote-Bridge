@@ -44,6 +44,18 @@ typedef struct __attribute__((packed)) {
     key_switch_map_entry_t entries[MAX_SWITCH_MAP];
 } switch_blob_t;
 
+// Global voice settings blob. Kept apart from the layer blobs so adding it did
+// not change their on-flash layout; an absent blob means factory defaults.
+#define VOICE_BLOB_MAGIC 0x56434647u
+#define VOICE_NVS_KEY    "voice"
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint8_t  trigger;
+    uint8_t  hotkey_mode;
+    uint16_t max_sec;
+} voice_blob_t;
+
 static SemaphoreHandle_t s_save_sem = NULL;
 
 // Shadow of what is currently in NVS, per key. A save skips any key whose bytes
@@ -54,6 +66,8 @@ static uint8_t *s_shadow[MAX_LAYERS];
 static size_t   s_shadow_len[MAX_LAYERS];
 static uint8_t *s_switch_shadow = NULL;
 static size_t   s_switch_shadow_len = 0;
+static voice_blob_t s_voice_shadow;
+static bool     s_voice_shadow_valid = false;
 
 // Forget the shadow so the next save rewrites everything (a blob is never zero
 // bytes long, so a zero length reliably means "unknown").
@@ -63,6 +77,14 @@ static void shadow_invalidate(void)
         s_shadow_len[i] = 0;
     }
     s_switch_shadow_len = 0;
+    s_voice_shadow_valid = false;
+}
+
+static void voice_config_sanitize(key_voice_config_t *v)
+{
+    if (v->trigger > VOICE_TRIGGER_HOLD) v->trigger = VOICE_TRIGGER_TOGGLE;
+    if (v->hotkey_mode > VOICE_HOTKEY_TAP_START) v->hotkey_mode = VOICE_HOTKEY_HOLD;
+    if (v->max_sec > VOICE_MAX_SEC_LIMIT) v->max_sec = VOICE_MAX_SEC_LIMIT;
 }
 
 static void shadow_alloc(void)
@@ -271,6 +293,11 @@ size_t key_config_to_json(const key_mapper_engine_t *engine, char *out, size_t o
         e["layer"] = engine->switch_map[i].target_layer;
     }
 
+    JsonObject voice = doc["voice"].to<JsonObject>();
+    voice["trigger"] = engine->voice.trigger;
+    voice["hotkey_mode"] = engine->voice.hotkey_mode;
+    voice["max_sec"] = engine->voice.max_sec;
+
     return serializeJson(doc, out, out_len);
 }
 
@@ -346,6 +373,29 @@ bool key_config_from_json(key_mapper_engine_t *engine, const char *json_str)
         }
     }
 
+    // Voice settings may be sent on their own, without layers.
+    key_engine_lock();
+    key_voice_config_t voice = engine->voice;
+    key_engine_unlock();
+    bool voice_present = doc["voice"].is<JsonObject>();
+    if (voice_present) {
+        JsonObject v = doc["voice"].as<JsonObject>();
+        voice.trigger = (uint8_t)parse_u32_or_hex(v["trigger"], voice.trigger);
+        voice.hotkey_mode = (uint8_t)parse_u32_or_hex(v["hotkey_mode"], voice.hotkey_mode);
+        voice.max_sec = (uint16_t)parse_u32_or_hex(v["max_sec"], voice.max_sec);
+        voice_config_sanitize(&voice);
+        if (!applied) {
+            key_engine_lock();
+            engine->voice = voice;
+            engine->config_rev++;
+            key_engine_unlock();
+            heap_caps_free(tmp);
+            app_log("KEYMAP", "Voice settings applied: trigger=%u hotkey=%u max=%us",
+                    voice.trigger, voice.hotkey_mode, voice.max_sec);
+            return true;
+        }
+    }
+
     if (applied) {
         app_log("KEYMAP", "Parsed L0=%u L1=%u L2=%u L3=%u L4=%u bindings",
                 (unsigned)tmp[0].binding_count, (unsigned)tmp[1].binding_count,
@@ -365,6 +415,9 @@ bool key_config_from_json(key_mapper_engine_t *engine, const char *json_str)
     if (smap_present) {
         memcpy(engine->switch_map, smap, smap_n * sizeof(key_switch_map_entry_t));
         engine->switch_map_count = smap_n;
+    }
+    if (voice_present) {
+        engine->voice = voice;
     }
     engine->config_rev++;
     uint32_t color = engine->layers[engine->active_layer].led_color;
@@ -452,6 +505,22 @@ bool key_config_storage_save(key_mapper_engine_t *engine)
                 memcpy(s_switch_shadow, sb, sizeof(switch_blob_t));
                 s_switch_shadow_len = sizeof(switch_blob_t);
             }
+            written++;
+        }
+    }
+
+    voice_blob_t vb;
+    vb.magic = VOICE_BLOB_MAGIC;
+    vb.trigger = engine->voice.trigger;
+    vb.hotkey_mode = engine->voice.hotkey_mode;
+    vb.max_sec = engine->voice.max_sec;
+    if (!(s_voice_shadow_valid && memcmp(&s_voice_shadow, &vb, sizeof(vb)) == 0)) {
+        if (nvs_set_blob(h, VOICE_NVS_KEY, &vb, sizeof(vb)) != ESP_OK) {
+            app_log("KEYMAP", "NVS write failed for %s", VOICE_NVS_KEY);
+            ok = false;
+        } else {
+            s_voice_shadow = vb;
+            s_voice_shadow_valid = true;
             written++;
         }
     }
@@ -565,6 +634,22 @@ bool key_config_storage_load(key_mapper_engine_t *engine)
             smap_load_ok = true;
         }
     }
+    key_voice_config_t voice_load;
+    bool voice_load_ok = false;
+    {
+        voice_blob_t vb;
+        size_t vlen = sizeof(vb);
+        if (nvs_get_blob(h, VOICE_NVS_KEY, &vb, &vlen) == ESP_OK &&
+            vlen == sizeof(vb) && vb.magic == VOICE_BLOB_MAGIC) {
+            voice_load.trigger = vb.trigger;
+            voice_load.hotkey_mode = vb.hotkey_mode;
+            voice_load.max_sec = vb.max_sec;
+            voice_config_sanitize(&voice_load);
+            voice_load_ok = true;
+            s_voice_shadow = vb;
+            s_voice_shadow_valid = true;
+        }
+    }
     nvs_close(h);
 
     if (!ok) {
@@ -572,6 +657,11 @@ bool key_config_storage_load(key_mapper_engine_t *engine)
         heap_caps_free(tmp);
         app_log("KEYMAP", "Stored keymap missing/invalid, using defaults");
         key_engine_load_defaults(engine);
+        if (voice_load_ok) {
+            key_engine_lock();
+            engine->voice = voice_load;
+            key_engine_unlock();
+        }
         return false;
     }
 
@@ -583,6 +673,9 @@ bool key_config_storage_load(key_mapper_engine_t *engine)
     if (smap_load_ok) {
         memcpy(engine->switch_map, smap_load, smap_load_n * sizeof(key_switch_map_entry_t));
         engine->switch_map_count = smap_load_n;
+    }
+    if (voice_load_ok) {
+        engine->voice = voice_load;
     }
     engine->config_rev++;
     uint32_t color = engine->layers[active].led_color;
@@ -642,6 +735,7 @@ void key_config_storage_reset_defaults(key_mapper_engine_t *engine)
     }
     config_store_erase_key(KEYMAP_NS, "active");
     config_store_erase_key(KEYMAP_NS, SWITCH_NVS_KEY);
+    config_store_erase_key(KEYMAP_NS, VOICE_NVS_KEY);
     shadow_invalidate();
 
     key_engine_lock();

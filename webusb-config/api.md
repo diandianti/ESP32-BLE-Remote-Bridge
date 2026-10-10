@@ -119,6 +119,24 @@ MiRC003.ACTION[1]              // "键盘-单击"
 > `SWITCH_LAYER`（9，立即切换配置）为旧接口，默认 UI 已不再提供；请改用
 > `ENTER_SWITCH_MODE`（16）。此处保留常量以便解析旧配置与遥测数据。
 
+### 语音设置常量（`keymap.voice`）
+
+| 常量 | 值 | 含义 |
+| :--- | :--- | :--- |
+| `VOICE_TRIGGER.TOGGLE` | 0 | 按一下语音键开始，再按一下结束（默认） |
+| `VOICE_TRIGGER.HOLD` | 1 | 按住说话，松开结束（遥控器自身最长约 15 s） |
+| `VOICE_HOTKEY_MODE.HOLD` | 0 | 电脑端快捷键在整个会话期间保持按下（默认） |
+| `VOICE_HOTKEY_MODE.TAP_BOTH` | 1 | 开始时单击一次，结束时再单击一次 |
+| `VOICE_HOTKEY_MODE.TAP_START` | 2 | 只在开始时单击一次 |
+| `VOICE_DEFAULTS` | `{ trigger: 0, hotkey_mode: 0, max_sec: 120 }` | 固件出厂值 |
+| `VOICE_MAX_SEC_LIMIT` | 3600 | `max_sec` 上限（秒） |
+
+- `trigger` 只对语音键是 ATVV 按键的遥控器（Google TV Remote）生效；小米 RC003 的语音键是
+  HID 按键，始终为「按住说话」。
+- `hotkey_mode = HOLD` 时修饰键（如右 Alt）在整个会话期间处于按下状态，期间在电脑键盘上按的其它键
+  会被系统视为组合键。输入法支持「按一下开关」时应选 `TAP_BOTH`。
+- `max_sec` 为单次会话最长时长（0 = 不限），到时固件自动结束会话并松开快捷键。
+
 ### 配置切换模式（`ENTER_SWITCH_MODE`）
 
 把某个按键的任一动作设为 `ENTER_SWITCH_MODE` 后，触发该动作会进入**配置切换模式**：
@@ -424,6 +442,8 @@ MiRC003.Keymap.action(MiRC003.ACTIONS.KEYBOARD_TAP, {
 | `getSwitchTarget(keymap, sourceVk)` | 读取某键在切换映射中的目标配置，未映射返回 `-1` |
 | `setSwitchTarget(keymap, sourceVk, layer)` | 设置某键的目标配置（`layer < 0` 表示移除）；返回条目或 `null` |
 | `removeSwitchTarget(keymap, sourceVk)` | 从切换映射中移除某键，返回是否发生变化 |
+| `getVoice(keymap)` | 读取全局语音设置 `{ trigger, hotkey_mode, max_sec }`，缺失字段按 `VOICE_DEFAULTS` 补齐 |
+| `setVoice(keymap, settings)` | 合并写入 `keymap.voice`（只修改传入的字段），返回合并后的设置 |
 | `setGesture(layer, sourceVk, gesture, action)` | 设置/清除手势；`action` 传 `null` 清除；返回 binding |
 | `getGesture(layer, sourceVk, gesture)` | 以动作对象读回手势，未设置返回 `null` |
 | `describe(layer, sourceVk)` | 生成可读的映射摘要 |
@@ -453,9 +473,16 @@ MiRC003.Keymap.setGesture(layer, 0x28, "repeat",
   MiRC003.Keymap.action(MiRC003.ACTIONS.CONSUMER_TAP,
     { consumerCode: 0xe9, delayMs: 350, intervalMs: 70 }));
 
-// 语音键（0x04）：按住时录音并发送微信语音快捷键（右Alt + ,）
+// 语音键（0x04）：录音并发送微信语音快捷键（右Alt + ,）
 MiRC003.Keymap.setGesture(layer, 0x04, "click",
   MiRC003.Keymap.action(MiRC003.ACTIONS.VOICE, { modifier: 0x40, keyCode: 0x36 }));
+
+// 语音设置（全局）：按一下开始/再按一下结束，快捷键开始/结束各单击一次，最长 60 秒
+MiRC003.Keymap.setVoice(km, {
+  trigger: MiRC003.VOICE_TRIGGER.TOGGLE,
+  hotkey_mode: MiRC003.VOICE_HOTKEY_MODE.TAP_BOTH,
+  max_sec: 60,
+});
 
 // 清除长按
 MiRC003.Keymap.setGesture(layer, 0x28, "long", null);
@@ -478,6 +505,11 @@ await dev.saveKeymap(km);
     { "source_vk": 81, "layer": 3 },   // 方向下 -> 配置 3
     { "source_vk": 80, "layer": 4 }    // 方向左 -> 配置 4
   ],
+  "voice": {
+    "trigger": 0,       // 0=按一下开始/再按结束 1=按住说话
+    "hotkey_mode": 0,   // 0=全程按住 1=开始/结束各单击 2=仅开始单击
+    "max_sec": 120      // 单次最长秒数，0=不限
+  },
   "layers": [
     {
       "id": 0,                 // 0..4
@@ -524,6 +556,9 @@ await dev.saveKeymap(km);
   `source_vk` 即切换到 `layer`；同一个 `source_vk` 只应出现一次，多个按键可指向同一配置。
   缺省值见 `MiRC003.SWITCH_MAP_DEFAULT`（上/右/下/左→1/2/3/4）。「确定键」由固件锁定为默认配置，
   无需也不应写入本表。
+- `voice`：全局语音设置，对所有配置方案生效，字段见[语音设置常量](#语音设置常量keymapvoice)。
+  可省略（固件保持原值）；也可以只发送 `{ "voice": {...} }` 而不带 `layers`，仅更新语音设置。
+  旧固件不返回该字段时，`Keymap.getVoice()` 按 `VOICE_DEFAULTS` 补齐。
 
 > 推荐使用 [`MiRC003.Keymap`](#4-mirc003keymap-工具) 读写上述字段，避免手写出错。
 
@@ -614,6 +649,7 @@ try {
 | `MiRC003.CMD` | `main/webusb/webusb_protocol.h` 的 `CMD_*` |
 | `MiRC003.STATUS` | 同文件的 `WEBUSB_*` |
 | `MiRC003.ACTIONS` | `main/keymap/key_state_machine.h` 的 `ACTION_*` |
+| `MiRC003.VOICE_TRIGGER` / `VOICE_HOTKEY_MODE` / `VOICE_MAX_SEC_LIMIT` | 同文件的 `voice_trigger_t` / `voice_hotkey_mode_t` / `VOICE_MAX_SEC_LIMIT` |
 | 遥测字段 | `key_telemetry_to_json()`（`main/keymap/key_config_storage.cpp`） |
 | `MiRC003.PHYSICAL_KEYS` / `KEY_SLOT_COUNT` / `DEFAULT_KEY_NAMES` | 固件的规范化键码表与槽位顺序：**数组下标必须等于物理槽位号**，两个 Google TV 索引表都按它取值 |
 | `MiRC003.KEY_NAME_MAX_BYTES` | 固件 `KEY_NAMES_SET` 的 31 字节上限 |

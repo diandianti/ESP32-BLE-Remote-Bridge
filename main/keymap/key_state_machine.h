@@ -99,6 +99,29 @@ typedef struct {
     uint8_t target_layer;
 } key_switch_map_entry_t;
 
+// How the remote's voice button drives a session. Only remotes whose voice
+// button is an ATVV button (Google TV Remote) can toggle; on the RC003 the
+// voice key is a HID key and a session always lasts while it is held.
+typedef enum {
+    VOICE_TRIGGER_TOGGLE = 0,   // press once to start, press again to stop
+    VOICE_TRIGGER_HOLD   = 1,   // talk while held (remote may cap it at 15 s)
+} voice_trigger_t;
+
+// How the PC voice hotkey of ACTION_VOICE_HOLD is sent.
+typedef enum {
+    VOICE_HOTKEY_HOLD      = 0, // held down for the whole session
+    VOICE_HOTKEY_TAP_BOTH  = 1, // tapped at start, tapped again at end
+    VOICE_HOTKEY_TAP_START = 2, // tapped at start only
+} voice_hotkey_mode_t;
+
+typedef struct {
+    uint8_t  trigger;           // voice_trigger_t
+    uint8_t  hotkey_mode;       // voice_hotkey_mode_t
+    uint16_t max_sec;           // session length limit, 0 = unlimited
+} key_voice_config_t;
+
+#define VOICE_MAX_SEC_LIMIT 3600
+
 typedef enum {
     LAYER_TYPE_PERSISTENT = 0,
     LAYER_TYPE_ONESHOT    = 1,
@@ -131,6 +154,8 @@ typedef struct {
     uint32_t               switch_mode_enter_ms;
     uint32_t               switch_mode_last_activity_ms;
     bool                   switch_mode_via_tv_rapid;
+    // Global voice behaviour, shared by every layer.
+    key_voice_config_t     voice;
     // Bumped whenever the stored configuration (layers/bindings/switch map)
     // changes, so clients can detect device-side updates.
     uint32_t               config_rev;
@@ -149,6 +174,9 @@ void key_engine_exit_switch_mode(key_mapper_engine_t *engine);
 
 /** @brief True while the configuration-switch mode is active. */
 bool key_engine_switch_mode_active(const key_mapper_engine_t *engine);
+
+/** @brief Snapshot of the global voice configuration (thread-safe). */
+key_voice_config_t key_engine_get_voice_config(const key_mapper_engine_t *engine);
 bool key_engine_set_layer_binding(key_mapper_engine_t *engine, uint8_t layer_idx, const key_binding_t *binding);
 bool key_engine_get_layer_binding(const key_mapper_engine_t *engine, uint8_t layer_idx, uint8_t source_vk, key_binding_t *out_binding);
 bool key_engine_set_binding(key_mapper_engine_t *engine, const key_binding_t *binding);

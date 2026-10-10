@@ -93,8 +93,8 @@ static bool s_discovery_started = false;
 // A fixed 10 s cap used to back that up, and it cut every longer dictation off
 // mid-sentence. The backstop is now "the audio stopped arriving": a session
 // whose AUDIO_STOP was lost goes quiet, a live one never does.
-// VOICE_SESSION_MAX_MS 0 means no length limit.
-#define VOICE_SESSION_MAX_MS     0
+// The length limit is user-configurable (voice.max_sec, 0 = none); it is what
+// ends a toggled session whose second key press was missed.
 #define VOICE_AUDIO_IDLE_MAX_MS  2000
 
 // Bound remote (persisted in NVS)
@@ -258,12 +258,15 @@ static void run_next_op(void)
             s_op_idx = 0;
             if (s_atvv_cmd_chr) {
                 // Google remote: GET_CAPS v1.0 - version(2) = 1.0, legacy
-                // constant 0x0003, interaction models (1) = 0x01 press-to-
-                // talk + on-request. Hold-to-talk (0x03) is deliberately not
-                // offered: see handle_atvv_ctl(). The RC003 keeps the v0.4
-                // request it has always been sent.
-                static const uint8_t caps_v10[6] = { 0x0A, 0x01, 0x00, 0x00, 0x03, 0x01 };
+                // constant 0x0003, interaction models (1): 0x01 press-to-talk
+                // + on-request for the toggle trigger, 0x03 adding hold-to-
+                // talk for the hold trigger (see handle_atvv_ctl()). The RC003
+                // keeps the v0.4 request it has always been sent.
+                uint8_t caps_v10[6] = { 0x0A, 0x01, 0x00, 0x00, 0x03, 0x01 };
                 static const uint8_t caps_v04[5] = { 0x0A, 0x00, 0x04, 0x00, 0x07 };
+                if (key_engine_get_voice_config(&g_key_engine).trigger == VOICE_TRIGGER_HOLD) {
+                    caps_v10[5] = 0x03;
+                }
                 bool google = (s_layout == REMOTE_LAYOUT_GOOGLE_TV);
                 s_ops[s_op_count].handle = s_atvv_cmd_chr;
                 memcpy(s_ops[s_op_count].data, google ? caps_v10 : caps_v04,
@@ -575,7 +578,12 @@ static void handle_atvv_ctl(const uint8_t *data, size_t len)
     // The RC003 keeps its original behaviour: its voice key is a HID key that
     // opens the microphone itself, so only a button-triggered AUDIO_START is
     // treated as a voice press there, and START_SEARCH is not acted on.
+    //
+    // The user can pick hold-to-talk instead (voice.trigger); then a button
+    // stop ends the session, and the remote's own 15 s cap applies.
     const bool google = (s_layout == REMOTE_LAYOUT_GOOGLE_TV);
+    const bool toggle = google &&
+        key_engine_get_voice_config(&g_key_engine).trigger == VOICE_TRIGGER_TOGGLE;
     if (op == ATVV_CTL_AUDIO_START && len >= 2) {
         uint8_t reason = data[1];
         uint8_t codec = (len >= 3) ? data[2] : 0;
@@ -602,7 +610,7 @@ static void handle_atvv_ctl(const uint8_t *data, size_t len)
             app_log("ATVV", "Voice stream continued (stream %u)", s_session_id);
             return;
         }
-        if (google && stream == ATVV_STREAM_HOST) {
+        if (toggle && stream == ATVV_STREAM_HOST) {
             // A late reply to the MIC_OPEN of a session that has since been
             // stopped. It is never a key press; close it again.
             s_session_id = stream;
@@ -610,7 +618,7 @@ static void handle_atvv_ctl(const uint8_t *data, size_t len)
             app_log("ATVV", "Closing late host stream after stop");
             return;
         }
-        if (google && by_button && (int32_t)(now_ms() - s_stop_guard_until_ms) < 0) {
+        if (toggle && by_button && (int32_t)(now_ms() - s_stop_guard_until_ms) < 0) {
             s_session_id = stream;
             atvv_send_mic_close();
             app_log("ATVV", "Ignoring stream %u from the stop press", stream);
@@ -632,7 +640,7 @@ static void handle_atvv_ctl(const uint8_t *data, size_t len)
             // Idle, or a new AUDIO_START follows immediately.
             return;
         }
-        if (google && reason == ATVV_STOP_HTT_RELEASE &&
+        if (toggle && reason == ATVV_STOP_HTT_RELEASE &&
             s_session_id == ATVV_STREAM_HOST && !s_continue_pending &&
             (int32_t)(now_ms() - s_stream_start_ms) < ATVV_REMOTE_STREAM_LIMIT_MS) {
             // Our own stream stopped early: the voice key was pressed.
@@ -641,7 +649,7 @@ static void handle_atvv_ctl(const uint8_t *data, size_t len)
             voice_session_end(false);
             return;
         }
-        if (google && reason == ATVV_STOP_HTT_RELEASE) {
+        if (toggle && reason == ATVV_STOP_HTT_RELEASE) {
             // The button stream ended (key released after the first press),
             // or the remote's 15 s limit hit: carry on with a host stream.
             app_log("ATVV", "Remote ended hold-to-talk -> continuing with MIC_OPEN");
@@ -1872,8 +1880,8 @@ void ble_remote_task(void)
         // unsigned it wrapped to ~4e9 and closed a live session mid-sentence.
         uint32_t last_audio = s_aud_last_ms ? s_aud_last_ms : s_talking_start_ms;
         bool idle = (int32_t)(now - last_audio) > VOICE_AUDIO_IDLE_MAX_MS;
-        bool too_long = VOICE_SESSION_MAX_MS > 0 &&
-                        (now - s_talking_start_ms) > (uint32_t)VOICE_SESSION_MAX_MS;
+        uint32_t max_ms = (uint32_t)key_engine_get_voice_config(&g_key_engine).max_sec * 1000u;
+        bool too_long = max_ms > 0 && (int32_t)(now - s_talking_start_ms) > (int32_t)max_ms;
         if (idle || too_long) {
             app_log("ATVV", "Voice session %s -> closing microphone",
                     idle ? "went silent" : "hit length limit");

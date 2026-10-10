@@ -83,6 +83,7 @@
           <div class="row">
             <button id="btn-keymap-activate" class="btn small">设为当前配置</button>
             <button id="btn-switch-open" class="btn small">配置切换模式…</button>
+            <button id="btn-voice-open" class="btn small">语音设置…</button>
             <button id="btn-keymap-refresh" class="btn small">读取</button>
             <button id="btn-keymap-save" class="btn small primary">保存到设备</button>
             <button id="btn-keymap-reset" class="btn small danger">恢复出厂</button>
@@ -265,7 +266,46 @@
     </div>
   </div>
 
-  <script src="assets/mi-rc003.js?v=11"></script>
-  <script src="assets/app.js?v=58"></script>
+  <!-- 语音设置弹窗 -->
+  <div id="voice-modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="card-head">
+        <h3>语音设置</h3>
+        <button id="voice-modal-close" class="btn small">关闭</button>
+      </div>
+      <p class="hint">
+        这些设置对所有配置方案生效。语音键发送的快捷键（如 右Alt+,）在「按键配置」里编辑语音键本身。
+      </p>
+      <div class="field">
+        <label>遥控器语音键</label>
+        <select id="voice-trigger">
+          <option value="0">按一下开始，再按一下结束</option>
+          <option value="1">按住说话，松开结束</option>
+        </select>
+        <p class="hint">仅 Google TV 遥控器可选。「按住说话」时遥控器自身最长约 15 秒；小米 RC003 始终为按住说话。</p>
+      </div>
+      <div class="field">
+        <label>电脑端快捷键发送方式</label>
+        <select id="voice-hotkey-mode">
+          <option value="0">整个会话期间按住（输入法需按住快捷键才录音）</option>
+          <option value="1">开始时按一下，结束时再按一下（输入法按一下开关）</option>
+          <option value="2">只在开始时按一下（输入法自动结束）</option>
+        </select>
+        <p class="hint">选「按住」时，录音期间修饰键（如 Alt）一直处于按下状态，此时键盘按下的其它键会变成组合键。输入法支持按一下开关时，建议选第二项。</p>
+      </div>
+      <div class="field">
+        <label>单次语音最长时长（秒，0 = 不限）</label>
+        <input type="number" id="voice-max-sec" min="0" max="3600" step="1" />
+        <p class="hint">按一下模式下若漏收第二次按键，到时会自动结束，避免快捷键一直按住。</p>
+      </div>
+      <div class="row end">
+        <button id="voice-modal-cancel" class="btn small">取消</button>
+        <button id="voice-modal-apply" class="btn small primary">应用</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="assets/mi-rc003.js?v=12"></script>
+  <script src="assets/app.js?v=59"></script>
 </body>
 </html>

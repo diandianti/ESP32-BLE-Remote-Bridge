@@ -122,6 +122,15 @@
   var GESTURES = { CLICK: "click", LONG: "long", DOUBLE: "double", REPEAT: "repeat" };
 
   /**
+   * Global voice settings (keymap.voice). Must match voice_trigger_t /
+   * voice_hotkey_mode_t in main/keymap/key_state_machine.h.
+   */
+  var VOICE_TRIGGER = { TOGGLE: 0, HOLD: 1 };
+  var VOICE_HOTKEY_MODE = { HOLD: 0, TAP_BOTH: 1, TAP_START: 2 };
+  var VOICE_DEFAULTS = { trigger: 0, hotkey_mode: 0, max_sec: 120 };
+  var VOICE_MAX_SEC_LIMIT = 3600;
+
+  /**
    * Physical remote keys (canonical `source_vk` values).
    *
    * The array index **is** the physical slot: the firmware resolves whatever a
@@ -380,6 +389,32 @@
       return entry;
     },
 
+    /**
+     * Global voice settings, with defaults filled in for older firmware that
+     * does not report them. Returns { trigger, hotkey_mode, max_sec }.
+     */
+    getVoice: function (keymap) {
+      var v = (keymap && keymap.voice) || {};
+      return {
+        trigger: v.trigger != null ? v.trigger : VOICE_DEFAULTS.trigger,
+        hotkey_mode: v.hotkey_mode != null ? v.hotkey_mode : VOICE_DEFAULTS.hotkey_mode,
+        max_sec: v.max_sec != null ? v.max_sec : VOICE_DEFAULTS.max_sec,
+      };
+    },
+
+    /** Merge voice settings into keymap.voice (only the given fields change). */
+    setVoice: function (keymap, settings) {
+      if (!keymap) return null;
+      var v = Keymap.getVoice(keymap);
+      if (settings) {
+        if (settings.trigger != null) v.trigger = settings.trigger;
+        if (settings.hotkey_mode != null) v.hotkey_mode = settings.hotkey_mode;
+        if (settings.max_sec != null) v.max_sec = settings.max_sec;
+      }
+      keymap.voice = v;
+      return v;
+    },
+
     /** Remove a key from the switch map. Returns true when something changed. */
     removeSwitchTarget: function (keymap, sourceVk) {
       if (!keymap || !Array.isArray(keymap.switch_map)) return false;
@@ -488,6 +523,22 @@
       });
       if (keymap.switch_map != null && !Array.isArray(keymap.switch_map)) {
         errors.push("switch_map 必须是数组");
+      }
+      if (keymap.voice != null) {
+        var v = keymap.voice;
+        if (typeof v !== "object") {
+          errors.push("voice 必须是对象");
+        } else {
+          if (v.trigger != null && v.trigger !== 0 && v.trigger !== 1) {
+            errors.push("voice.trigger 只能是 0 或 1");
+          }
+          if (v.hotkey_mode != null && [0, 1, 2].indexOf(v.hotkey_mode) < 0) {
+            errors.push("voice.hotkey_mode 只能是 0、1 或 2");
+          }
+          if (v.max_sec != null && !(v.max_sec >= 0 && v.max_sec <= VOICE_MAX_SEC_LIMIT)) {
+            errors.push("voice.max_sec 必须在 0.." + VOICE_MAX_SEC_LIMIT + " 之间");
+          }
+        }
       }
       return errors;
     },
@@ -933,6 +984,10 @@
   MiRC003.ACTIONS = ACTIONS;
   MiRC003.ACTION = ACTION;
   MiRC003.GESTURES = GESTURES;
+  MiRC003.VOICE_TRIGGER = VOICE_TRIGGER;
+  MiRC003.VOICE_HOTKEY_MODE = VOICE_HOTKEY_MODE;
+  MiRC003.VOICE_DEFAULTS = VOICE_DEFAULTS;
+  MiRC003.VOICE_MAX_SEC_LIMIT = VOICE_MAX_SEC_LIMIT;
   MiRC003.PHYSICAL_KEYS = PHYSICAL_KEYS;
   MiRC003.KEY_SLOT_COUNT = KEY_SLOT_COUNT;
   MiRC003.DEFAULT_KEY_NAMES = DEFAULT_KEY_NAMES;

@@ -11,6 +11,8 @@
 #include "tusb.h"
 #include "class/hid/hid_device.h"
 
+extern key_mapper_engine_t g_key_engine;
+
 #define HID_REPORT_ID_KEYBOARD 1
 #define HID_REPORT_ID_CONSUMER 2
 #define HID_REPORT_ID_MOUSE    3
@@ -27,6 +29,12 @@ static bool s_release_task_started = false;
 // receiving a pressed key/button, cleared on release).
 static bool s_keyboard_pressed = false;
 static bool s_consumer_pressed = false;
+
+// Hotkey of the running voice session, latched at its start so the end of the
+// session sends the same chord even if the configuration changed meanwhile.
+static uint8_t s_voice_hotkey_mode = VOICE_HOTKEY_HOLD;
+static uint8_t s_voice_mod = 0;
+static uint8_t s_voice_key = 0;
 
 static void update_hid_led(void)
 {
@@ -327,14 +335,31 @@ void usb_hid_dispatch_action(const key_action_t *action)
         case ACTION_CONSUMER_RELEASE:
             usb_hid_consumer_release();
             break;
-        case ACTION_VOICE_HOLD:
+        case ACTION_VOICE_HOLD: {
+            // Holding the hotkey for the whole session keeps its modifier
+            // down, which turns every key typed meanwhile into a chord (RAlt+x).
+            // Input methods that toggle on a tap are therefore sent a tap.
+            key_voice_config_t vc = key_engine_get_voice_config(&g_key_engine);
+            s_voice_hotkey_mode = vc.hotkey_mode;
+            s_voice_mod = action->modifier;
+            s_voice_key = action->key_code;
             audio_pipeline_start_session(&g_audio_pipeline, 0);
             if (action->modifier != 0 || action->key_code != 0) {
-                usb_hid_keyboard_press(action->modifier, action->key_code);
+                if (s_voice_hotkey_mode == VOICE_HOTKEY_HOLD) {
+                    usb_hid_keyboard_press(action->modifier, action->key_code);
+                } else {
+                    usb_hid_keyboard_tap(action->modifier, action->key_code);
+                }
             }
             break;
+        }
         case ACTION_VOICE_RELEASE:
-            usb_hid_keyboard_release();
+            if (s_voice_hotkey_mode == VOICE_HOTKEY_HOLD) {
+                usb_hid_keyboard_release();
+            } else if (s_voice_hotkey_mode == VOICE_HOTKEY_TAP_BOTH &&
+                       (s_voice_mod != 0 || s_voice_key != 0)) {
+                usb_hid_keyboard_tap(s_voice_mod, s_voice_key);
+            }
             audio_pipeline_stop_session(&g_audio_pipeline);
             break;
         case ACTION_MOUSE_BUTTON_TAP:

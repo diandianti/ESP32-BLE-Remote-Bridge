@@ -1268,7 +1268,7 @@
         </div>
         <div class="f-voice">
           <div class="field">
-            <label>语音快捷键（按住语音键期间发送）</label>
+            <label>语音快捷键（发送方式见「语音设置」）</label>
             <select class="f-voice-shortcut">${voiceOptions}</select>
           </div>
         </div>
@@ -1669,6 +1669,34 @@
       dirty = true;
       updateDirtyIndicator();
       renderSwitchMap();
+      toast("已修改，点击「保存到设备」生效");
+    };
+
+    // Voice settings modal (keymap.voice, saved with the keymap).
+    const voiceOpen = $("btn-voice-open");
+    if (voiceOpen) voiceOpen.onclick = () => {
+      if (!keymap) { toast("请先连接设备并读取按键配置", true); return; }
+      const v = Keymap.getVoice(keymap);
+      $("voice-trigger").value = String(v.trigger);
+      $("voice-hotkey-mode").value = String(v.hotkey_mode);
+      $("voice-max-sec").value = String(v.max_sec);
+      $("voice-modal").classList.remove("hidden");
+    };
+    const closeVoiceModal = () => $("voice-modal").classList.add("hidden");
+    $("voice-modal-close").onclick = $("voice-modal-cancel").onclick = closeVoiceModal;
+    $("voice-modal-apply").onclick = () => {
+      let maxSec = parseInt($("voice-max-sec").value, 10);
+      if (!(maxSec >= 0)) maxSec = 0;
+      if (maxSec > MiRC003.VOICE_MAX_SEC_LIMIT) maxSec = MiRC003.VOICE_MAX_SEC_LIMIT;
+      Keymap.setVoice(keymap, {
+        trigger: parseInt($("voice-trigger").value, 10),
+        hotkey_mode: parseInt($("voice-hotkey-mode").value, 10),
+        max_sec: maxSec,
+      });
+      closeVoiceModal();
+      dirty = true;
+      updateDirtyIndicator();
+      $("raw-json").value = JSON.stringify(keymap, null, 2);
       toast("已修改，点击「保存到设备」生效");
     };
 
