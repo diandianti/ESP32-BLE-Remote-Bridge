@@ -86,12 +86,16 @@ static size_t s_frame_size = AUDIO_DEFAULT_FRAME_BYTES;
 static uint8_t s_session_id = 0;
 static uint32_t s_conn_start_ms = 0;
 static uint32_t s_talking_start_ms = 0;
+static uint32_t s_mic_extend_last_ms = 0;
 static bool s_discovery_started = false;
 
 // The remote closes the microphone itself (AUDIO_STOP) in the normal case.
-// This is only a backstop so a lost notification cannot leave the remote
-// encoding forever: the specification's own session timer is 7 seconds.
-#define VOICE_SESSION_MAX_MS 10000
+// A fixed 10 s cap used to back that up, and it cut every longer dictation off
+// mid-sentence. The backstop is now "the audio stopped arriving": a session
+// whose AUDIO_STOP was lost goes quiet, a live one never does.
+// VOICE_SESSION_MAX_MS 0 means no length limit.
+#define VOICE_SESSION_MAX_MS     0
+#define VOICE_AUDIO_IDLE_MAX_MS  2000
 
 // Bound remote (persisted in NVS)
 static char    s_bound_mac[18] = {0};
@@ -145,6 +149,15 @@ static bool mac_equals(const char *a, const char *b)
     }
     return *a == '\0' && *b == '\0';
 }
+
+// Which remote family is connected; see "Remote layout" below.
+typedef enum {
+    REMOTE_LAYOUT_UNKNOWN = 0,
+    REMOTE_LAYOUT_RC003,
+    REMOTE_LAYOUT_GOOGLE_TV,
+} remote_layout_t;
+
+static remote_layout_t s_layout = REMOTE_LAYOUT_UNKNOWN;
 
 // ===========================================================================
 // Write operation queue (chained GATT procedures)
@@ -244,15 +257,18 @@ static void run_next_op(void)
             s_op_count = 0;
             s_op_idx = 0;
             if (s_atvv_cmd_chr) {
-                // ATVV GET_CAPS: opcode 0x0A followed by version(2) and
-                // codecs_supported(2). Version 0.4 is the revision this
-                // firmware implements; advertising codec 0x0007 (Opus plus
-                // ADPCM at 8 and 16 kHz) lets every remote pick a codec it
-                // actually has, and the reply tells us which one it chose.
-                static const uint8_t caps[5] = { 0x0A, 0x00, 0x04, 0x00, 0x07 };
+                // Google remote: GET_CAPS v1.0 - version(2) = 1.0, legacy
+                // constant 0x0003, interaction models (1) = 0x01 press-to-
+                // talk + on-request. Hold-to-talk (0x03) is deliberately not
+                // offered: see handle_atvv_ctl(). The RC003 keeps the v0.4
+                // request it has always been sent.
+                static const uint8_t caps_v10[6] = { 0x0A, 0x01, 0x00, 0x00, 0x03, 0x01 };
+                static const uint8_t caps_v04[5] = { 0x0A, 0x00, 0x04, 0x00, 0x07 };
+                bool google = (s_layout == REMOTE_LAYOUT_GOOGLE_TV);
                 s_ops[s_op_count].handle = s_atvv_cmd_chr;
-                memcpy(s_ops[s_op_count].data, caps, sizeof(caps));
-                s_ops[s_op_count].len = sizeof(caps);
+                memcpy(s_ops[s_op_count].data, google ? caps_v10 : caps_v04,
+                       google ? sizeof(caps_v10) : sizeof(caps_v04));
+                s_ops[s_op_count].len = google ? sizeof(caps_v10) : sizeof(caps_v04);
                 s_op_count++;
             }
             run_next_op();
@@ -267,6 +283,16 @@ static void run_next_op(void)
     }
 
     gatt_op_t *op = &s_ops[s_op_idx];
+    if (op->handle == s_atvv_cmd_chr) {
+        // The ATVV command characteristic rejects a Write Request with ATT
+        // 0x03 (write not permitted, logged as 259): it only accepts Write
+        // Without Response, so GET_CAPS never reached the remote before.
+        int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, op->handle, op->data, op->len);
+        app_log("ATVV", "GET_CAPS sent (no response) rc=%d", rc);
+        s_op_idx++;
+        run_next_op();
+        return;
+    }
     int rc = ble_gattc_write_flat(s_conn_handle, op->handle, op->data, op->len, write_cb, NULL);
     if (rc != 0) {
         app_log("BLE", "ble_gattc_write_flat(0x%04X) rc=%d", op->handle, rc);
@@ -478,30 +504,165 @@ static void atvv_audio_arm_dump(void);
 // control handler and the HID handlers both consult it.
 static bool s_raw_report_log;
 
+// ATVV control-characteristic opcodes and reason codes (Voice over BLE v1.0).
+#define ATVV_CTL_AUDIO_STOP       0x00
+#define ATVV_CTL_AUDIO_START      0x04
+#define ATVV_CTL_START_SEARCH     0x08
+#define ATVV_CTL_MIC_OPEN_ERROR   0x0C
+#define ATVV_START_PTT            0x01
+#define ATVV_START_HTT            0x03
+#define ATVV_STOP_HTT_RELEASE     0x02
+#define ATVV_STOP_UPCOMING_START  0x04
+
+// Stream id 0 is the host-owned stream our MIC_OPEN started; ids 0x01..0x80
+// are streams the remote started for a button press.
+#define ATVV_STREAM_HOST          0x00
+// The remote ends any stream after 15 s with AUDIO_STOP(0x02). A 0x02 that
+// comes sooner on the host-owned stream is the voice key being pressed.
+#define ATVV_REMOTE_STREAM_LIMIT_MS 14000
+// A press that ends the host stream may be followed by its own button
+// AUDIO_START; one that arrives this soon after is the same press, not a new
+// one. Short, so a deliberate quick re-press still starts a new session.
+#define ATVV_STOP_PRESS_GUARD_MS  500
+
+// Set while the MIC_OPEN that continues a hold-to-talk session is in flight.
+static bool s_continue_pending = false;
+// When the current stream (not session) started.
+static uint32_t s_stream_start_ms = 0;
+// Until when a button AUDIO_START belongs to the press that just stopped us.
+static uint32_t s_stop_guard_until_ms = 0;
+
+// End the current voice session: release the voice action, and tell the
+// remote to stop encoding unless it already has.
+static void voice_session_end(bool send_close)
+{
+    s_state = BLE_STATE_CONNECTED;
+    s_continue_pending = false;
+    atvv_audio_log_stats();
+    if (send_close) atvv_send_mic_close();
+    key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, false, now_ms());
+    app_log("ATVV", "Voice stop after %lu ms", (unsigned long)(now_ms() - s_talking_start_ms));
+}
+
 static void handle_atvv_ctl(const uint8_t *data, size_t len)
 {
     if (len < 1) return;
     uint8_t op = data[0];
 
-    if (op == 0x04 && len >= 2 && data[1] == 0x03) {
-        s_session_id = (len >= 4) ? data[3] : 0;
+    // Control messages are rare (start, stop, one sync per frame is excluded
+    // below), so log every one: the stop reason is what tells a key release
+    // apart from the remote's own session timeout.
+    if (op != 0x0A) {
+        char hex[3 * 16 + 1];
+        size_t n = (len < 16) ? len : 16;
+        for (size_t i = 0; i < n; i++) snprintf(&hex[i * 3], 4, "%02X ", data[i]);
+        hex[n * 3] = '\0';
+        app_log("ATVV", "ctl rx len=%u [%s]", (unsigned)len, hex);
+    }
+
+    // Voice is press-to-start, press-to-stop. The remote's hold-to-talk mode
+    // cannot be used: the ZTKA-IR57 reports "button released" (AUDIO_STOP
+    // reason 0x02) after exactly 15 s with the button still held, and
+    // MIC_EXTEND does not move that limit. GET_CAPS therefore asks for
+    // press-to-talk, where the session lasts until the host's MIC_CLOSE and
+    // MIC_EXTEND keeps it alive. START_SEARCH (on-request remotes) is handled
+    // the same way: first press opens the microphone, the next one closes it.
+    //
+    // A remote that ignores the request and stays in hold-to-talk still works:
+    // its "button released" stop is answered with MIC_OPEN, which turns the
+    // session into a host-owned stream that only MIC_CLOSE ends.
+    //
+    // The RC003 keeps its original behaviour: its voice key is a HID key that
+    // opens the microphone itself, so only a button-triggered AUDIO_START is
+    // treated as a voice press there, and START_SEARCH is not acted on.
+    const bool google = (s_layout == REMOTE_LAYOUT_GOOGLE_TV);
+    if (op == ATVV_CTL_AUDIO_START && len >= 2) {
+        uint8_t reason = data[1];
         uint8_t codec = (len >= 3) ? data[2] : 0;
+        bool by_button = (reason == ATVV_START_PTT || reason == ATVV_START_HTT);
+        uint8_t stream = (len >= 4) ? data[3] : 0;
+        if (!google && reason != ATVV_START_HTT) return;
+        if (s_state == BLE_STATE_TALKING) {
+            // The reply to our own MIC_OPEN carries stream id 0 (the remote
+            // labels it reason 0x01, so the reason alone cannot tell). A
+            // button stream (id != 0) appearing once the first button stream
+            // has ended - while we own the stream, or while our MIC_OPEN is
+            // still in flight - is the voice key pressed again.
+            if (by_button && stream != ATVV_STREAM_HOST &&
+                (s_session_id == ATVV_STREAM_HOST || s_continue_pending)) {
+                s_session_id = stream;
+                app_log("ATVV", "Voice key pressed again -> stop");
+                voice_session_end(true);
+                return;
+            }
+            if (stream == ATVV_STREAM_HOST) s_continue_pending = false;
+            s_session_id = stream;
+            s_stream_start_ms = now_ms();
+            atvv_audio_begin_session();
+            app_log("ATVV", "Voice stream continued (stream %u)", s_session_id);
+            return;
+        }
+        if (google && stream == ATVV_STREAM_HOST) {
+            // A late reply to the MIC_OPEN of a session that has since been
+            // stopped. It is never a key press; close it again.
+            s_session_id = stream;
+            atvv_send_mic_close();
+            app_log("ATVV", "Closing late host stream after stop");
+            return;
+        }
+        if (google && by_button && (int32_t)(now_ms() - s_stop_guard_until_ms) < 0) {
+            s_session_id = stream;
+            atvv_send_mic_close();
+            app_log("ATVV", "Ignoring stream %u from the stop press", stream);
+            return;
+        }
+        s_session_id = stream;
+        s_stream_start_ms = now_ms();
         s_state = BLE_STATE_TALKING;
         s_talking_start_ms = now_ms();
+        s_mic_extend_last_ms = s_talking_start_ms;
         atvv_audio_reset_stats();
         atvv_audio_begin_session();
         atvv_audio_arm_dump();
         key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, true, now_ms());
-        app_log("ATVV", "Voice start (session %u, codec %u)", s_session_id, codec);
-    } else if (op == 0x00 || op == 0x08) {
+        app_log("ATVV", "Voice start (reason %u, stream %u, codec %u)", reason, s_session_id, codec);
+    } else if (op == ATVV_CTL_AUDIO_STOP) {
+        uint8_t reason = (len >= 2) ? data[1] : 0;
+        if (s_state != BLE_STATE_TALKING || reason == ATVV_STOP_UPCOMING_START) {
+            // Idle, or a new AUDIO_START follows immediately.
+            return;
+        }
+        if (google && reason == ATVV_STOP_HTT_RELEASE &&
+            s_session_id == ATVV_STREAM_HOST && !s_continue_pending &&
+            (int32_t)(now_ms() - s_stream_start_ms) < ATVV_REMOTE_STREAM_LIMIT_MS) {
+            // Our own stream stopped early: the voice key was pressed.
+            app_log("ATVV", "Voice key pressed again -> stop");
+            s_stop_guard_until_ms = now_ms() + ATVV_STOP_PRESS_GUARD_MS;
+            voice_session_end(false);
+            return;
+        }
+        if (google && reason == ATVV_STOP_HTT_RELEASE) {
+            // The button stream ended (key released after the first press),
+            // or the remote's 15 s limit hit: carry on with a host stream.
+            app_log("ATVV", "Remote ended hold-to-talk -> continuing with MIC_OPEN");
+            s_continue_pending = true;
+            atvv_send_mic_open();
+            return;
+        }
+        app_log("ATVV", "Remote stopped audio (reason 0x%02X)", reason);
+        // MIC_CLOSE as before: a remote that already stopped ignores it.
+        voice_session_end(true);
+    } else if (op == ATVV_CTL_START_SEARCH) {
         if (s_state == BLE_STATE_TALKING) {
-            s_state = BLE_STATE_CONNECTED;
-            atvv_audio_log_stats();
-            // Tell the remote to stop encoding, otherwise it keeps the
-            // microphone running until its own timeout expires.
-            atvv_send_mic_close();
-            key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, false, now_ms());
-            app_log("ATVV", "Voice stop");
+            app_log("ATVV", "Voice key pressed again -> stop");
+            voice_session_end(true);
+        } else if (google) {
+            atvv_send_mic_open();
+        }
+    } else if (op == ATVV_CTL_MIC_OPEN_ERROR && len >= 3) {
+        app_log("ATVV", "MIC_OPEN_ERROR 0x%04X", (unsigned)((data[1] << 8) | data[2]));
+        if (s_state == BLE_STATE_TALKING && s_continue_pending) {
+            voice_session_end(false);  // the continuation was refused
         }
     } else if (op == 0x0B && len >= 7) {
         uint16_t ver = (uint16_t)((data[1] << 8) | data[2]);
@@ -510,7 +671,7 @@ static void handle_atvv_ctl(const uint8_t *data, size_t len)
         if (fs > 0) s_frame_size = fs;
         app_log("ATVV", "Capabilities: ver=0x%04X codecs=0x%02X frame=%u",
                 ver, codecs, (unsigned)s_frame_size);
-        if (s_raw_report_log && len <= 16) {
+        if (len <= 16) {
             char hex[3 * 16 + 1];
             for (size_t i = 0; i < len; i++) {
                 snprintf(&hex[i * 3], 4, "%02X ", data[i]);
@@ -546,20 +707,37 @@ static void handle_atvv_ctl(const uint8_t *data, size_t len)
 static void atvv_send_mic_open(void)
 {
     if (!s_atvv_cmd_chr || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
-    static const uint8_t cmd[3] = {
-        0x0C, (uint8_t)(ATVV_MIC_CODEC & 0xFF), (uint8_t)(ATVV_MIC_CODEC >> 8)
-    };
-    int rc = ble_gattc_write_flat(s_conn_handle, s_atvv_cmd_chr, cmd, sizeof(cmd), NULL, NULL);
+    // The Google remote speaks v1.0, which reads byte 1 as the mic mode
+    // (0x00 = playback, realtime); v0.4 reads a big-endian codec, so one
+    // layout serves both. The RC003 keeps the bytes it has always been sent.
+    uint8_t cmd[3] = { 0x0C, (uint8_t)(ATVV_MIC_CODEC & 0xFF), (uint8_t)(ATVV_MIC_CODEC >> 8) };
+    if (s_layout == REMOTE_LAYOUT_GOOGLE_TV) {
+        cmd[1] = (uint8_t)(ATVV_MIC_CODEC >> 8);
+        cmd[2] = (uint8_t)(ATVV_MIC_CODEC & 0xFF);
+    }
+    int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, s_atvv_cmd_chr, cmd, sizeof(cmd));
     app_log("ATVV", "MIC_OPEN (codec 0x%04X = %s) rc=%d",
             (unsigned)ATVV_MIC_CODEC, ATVV_MIC_CODEC_NAME, rc);
+}
+
+// ATVV MIC_EXTEND: opcode 0x0E followed by the stream id from AUDIO_START.
+// Resets the remote's Audio Transfer Timeout, which would otherwise end a
+// press-to-talk or on-request session after 15 s - 1 min.
+static void atvv_send_mic_extend(void)
+{
+    if (!s_atvv_cmd_chr || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+    uint8_t cmd[2] = { 0x0E, s_session_id };
+    int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, s_atvv_cmd_chr, cmd, sizeof(cmd));
+    app_log("ATVV", "MIC_EXTEND stream=%u rc=%d", (unsigned)s_session_id, rc);
 }
 
 // ATVV MIC_CLOSE: opcode 0x0D, no payload.
 static void atvv_send_mic_close(void)
 {
     if (!s_atvv_cmd_chr || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
-    static const uint8_t cmd[1] = { 0x0D };
-    int rc = ble_gattc_write_flat(s_conn_handle, s_atvv_cmd_chr, cmd, sizeof(cmd), NULL, NULL);
+    // v1.0 carries the stream id; a v0.4 remote ignores the extra byte.
+    uint8_t cmd[2] = { 0x0D, s_session_id };
+    int rc = ble_gattc_write_no_rsp_flat(s_conn_handle, s_atvv_cmd_chr, cmd, sizeof(cmd));
     app_log("ATVV", "MIC_CLOSE rc=%d", rc);
 }
 
@@ -573,12 +751,8 @@ static void atvv_send_mic_close(void)
 // and a Google index report `[01]` are indistinguishable from the bytes
 // alone. The layout is therefore decided once per connection from the
 // advertised name, with a manual override for anything unusual.
+// (remote_layout_t and s_layout are declared near the top of the file.)
 // ===========================================================================
-typedef enum {
-    REMOTE_LAYOUT_UNKNOWN = 0,
-    REMOTE_LAYOUT_RC003,
-    REMOTE_LAYOUT_GOOGLE_TV,
-} remote_layout_t;
 
 // Counts every HID notification that reaches the parser, so "the remote is not
 // being heard at all" is distinguishable from "the report was not understood".
@@ -602,7 +776,6 @@ static uint32_t s_release_calls = 0;
 static uint32_t s_health_last_ms = 0;
 static uint32_t s_health_last_reports = 0;
 
-static remote_layout_t s_layout = REMOTE_LAYOUT_UNKNOWN;
 static remote_layout_t s_layout_override = REMOTE_LAYOUT_UNKNOWN;
 
 const char *ble_remote_layout_name(void)
@@ -1408,8 +1581,18 @@ static uint32_t s_aud_max_ms = 0;
 static uint16_t s_aud_len_min = 0xFFFF;
 static uint16_t s_aud_len_max = 0;
 
+// How far the decoder had drifted from the encoder by the end of each frame,
+// measured against the next frame's sync word. Near zero means the header
+// layout and nibble order are right; large values mean they are not.
+static uint32_t s_sync_count = 0;
+static uint32_t s_sync_pred_err_max = 0;
+static uint32_t s_sync_step_err_max = 0;
+
 static void atvv_audio_reset_stats(void)
 {
+    s_sync_count = 0;
+    s_sync_pred_err_max = 0;
+    s_sync_step_err_max = 0;
     s_aud_frame_total = 0;
     s_aud_bytes_total = 0;
     s_aud_last_ms = 0;
@@ -1450,7 +1633,15 @@ static void atvv_audio_log_stats(void)
             (unsigned)s_aud_len_min, (unsigned)s_aud_len_max,
             (unsigned long)((s_aud_min_ms == 0xFFFFFFFFu) ? 0 : s_aud_min_ms),
             (unsigned long)s_aud_max_ms);
-    if (atvv_audio_header_detected()) {
+    if (atvv_audio_seq_framed()) {
+        app_log("ATVV", "seq framing: frames=%lu last_seq=%u pred=%d step=%d resync=%lu dropped=%lu",
+                (unsigned long)st.frames, (unsigned)st.last_frame_number,
+                st.last_predictor, st.last_step_index,
+                (unsigned long)st.resyncs, (unsigned long)st.dropped_packets);
+        app_log("ATVV", "seq sync drift: frames=%lu max_pred_err=%lu max_step_err=%lu",
+                (unsigned long)s_sync_count, (unsigned long)s_sync_pred_err_max,
+                (unsigned long)s_sync_step_err_max);
+    } else if (atvv_audio_header_detected()) {
         app_log("ATVV", "ATVV framing: ver=0x%02X frame=%u codec=0x%02X resync=%lu dropped=%lu",
                 st.version, (unsigned)st.last_frame_number, st.codec_bits,
                 (unsigned long)st.resyncs, (unsigned long)st.dropped_packets);
@@ -1469,6 +1660,19 @@ static void atvv_audio_log_stats(void)
 void atvv_audio_payload_ready(const uint8_t *payload, size_t len)
 {
     audio_pipeline_feed_adpcm(&g_audio_pipeline, payload, len);
+}
+
+void atvv_audio_sync_ready(int16_t predictor, int8_t step_index)
+{
+    if (s_sync_count++ > 0) {
+        int32_t dp = g_audio_pipeline.adpcm.predictor - predictor;
+        int32_t ds = g_audio_pipeline.adpcm.step_index - step_index;
+        if (dp < 0) dp = -dp;
+        if (ds < 0) ds = -ds;
+        if ((uint32_t)dp > s_sync_pred_err_max) s_sync_pred_err_max = (uint32_t)dp;
+        if ((uint32_t)ds > s_sync_step_err_max) s_sync_step_err_max = (uint32_t)ds;
+    }
+    audio_pipeline_sync(&g_audio_pipeline, predictor, step_index);
 }
 
 // ===========================================================================
@@ -1653,15 +1857,28 @@ void ble_remote_task(void)
         s_health_last_reports = s_reports_seen_total;
     }
 
-    // Backstop: a microphone session must not outlive the specification's own
-    // session timer, even if AUDIO_STOP never arrives.
-    if (s_state == BLE_STATE_TALKING && (now - s_talking_start_ms) > VOICE_SESSION_MAX_MS) {
-        app_log("ATVV", "Voice session exceeded %d ms -> closing microphone",
-                VOICE_SESSION_MAX_MS);
-        s_state = BLE_STATE_CONNECTED;
-        atvv_audio_log_stats();
-        atvv_send_mic_close();
-        key_engine_feed_key(&g_key_engine, MI_KEY_VOICE, false, now);
+    // Keep the remote's own session timer from ending a long dictation.
+    if (s_state == BLE_STATE_TALKING &&
+        (int32_t)(now - s_mic_extend_last_ms) >= BLE_KEEP_ALIVE_INTERVAL) {
+        s_mic_extend_last_ms = now;
+        atvv_send_mic_extend();
+    }
+
+    // Backstop for a lost AUDIO_STOP: close the session once audio has stopped
+    // arriving, or (if configured) once it exceeds the length limit.
+    if (s_state == BLE_STATE_TALKING) {
+        // s_aud_last_ms is written by the NimBLE host task, so a notification
+        // can land after `now` was sampled. The difference must be signed: as
+        // unsigned it wrapped to ~4e9 and closed a live session mid-sentence.
+        uint32_t last_audio = s_aud_last_ms ? s_aud_last_ms : s_talking_start_ms;
+        bool idle = (int32_t)(now - last_audio) > VOICE_AUDIO_IDLE_MAX_MS;
+        bool too_long = VOICE_SESSION_MAX_MS > 0 &&
+                        (now - s_talking_start_ms) > (uint32_t)VOICE_SESSION_MAX_MS;
+        if (idle || too_long) {
+            app_log("ATVV", "Voice session %s -> closing microphone",
+                    idle ? "went silent" : "hit length limit");
+            voice_session_end(true);
+        }
     }
 
     // Refresh the remote battery level periodically while connected.

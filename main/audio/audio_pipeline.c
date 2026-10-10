@@ -112,7 +112,6 @@ size_t audio_pipeline_feed_adpcm(audio_pipeline_t *pipeline, const uint8_t *adpc
         //    measured noise floor of a live session is 85% below 500 Hz, so a
         //    DC blocker removed none of what is actually audible as rumble.
         audio_filter_highpass(&pipeline->filter, pipeline->temp_pcm, samples_decoded);
-        audio_filter_highpass(&pipeline->filter, pipeline->temp_pcm, samples_decoded);
 
         // 4. Dynamic AGC + soft clip. During the lead-mute window feed zeros so the
         //    peak envelope does not decay and the gain stays locked at 1.0x.

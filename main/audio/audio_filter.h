@@ -10,8 +10,12 @@ extern "C" {
 typedef struct {
     int16_t prev_decoded;
     int16_t last_sample;
-    float   dc_x;
-    float   dc_y;
+    // One (x, y) history pair per cascaded high-pass section. Sharing a single
+    // pair between the two sections fed each one the other's history at every
+    // block boundary, which re-injected the DC it was meant to remove as a
+    // step once per BLE packet.
+    float   hp_x[2];
+    float   hp_y[2];
 } audio_filter_state_t;
 
 void audio_filter_init(audio_filter_state_t *state);
@@ -19,10 +23,8 @@ void audio_filter_declip(audio_filter_state_t *state, int16_t *samples, size_t c
 void audio_filter_lowpass(audio_filter_state_t *state, int16_t *samples, size_t count);
 
 /**
- * @brief One-pole high-pass section at AUDIO_HP_HZ.
- *
- * Call it twice in a row on the same buffer to get a second-order (12 dB/oct)
- * roll-off: the state is shared, so consecutive calls cascade correctly.
+ * @brief Speech high-pass at AUDIO_HP_HZ: two cascaded one-pole sections
+ *        (12 dB/oct), each with its own history.
  */
 void audio_filter_highpass(audio_filter_state_t *state, int16_t *samples, size_t count);
 

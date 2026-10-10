@@ -7,8 +7,10 @@ void audio_filter_init(audio_filter_state_t *state)
     if (!state) return;
     state->prev_decoded = 0;
     state->last_sample = 0;
-    state->dc_x = 0.0f;
-    state->dc_y = 0.0f;
+    for (int s = 0; s < 2; s++) {
+        state->hp_x[s] = 0.0f;
+        state->hp_y[s] = 0.0f;
+    }
 }
 
 void audio_filter_declip(audio_filter_state_t *state, int16_t *samples, size_t count, int16_t threshold)
@@ -51,25 +53,28 @@ void audio_filter_highpass(audio_filter_state_t *state, int16_t *samples, size_t
 {
     if (!state || !samples || count == 0) return;
 
-    float y_prev = state->dc_y;
-    float x_prev = state->dc_x;
-    // One-pole high-pass, corner AUDIO_HP_HZ. This used to sit at R = 0.985,
-    // i.e. about 19 Hz at 8 kHz - a DC blocker, not a filter. Measurement of a
-    // live session showed the noise floor is 85% concentrated below 500 Hz
-    // (boom and handling rumble, not hiss), and 19 Hz removed none of it.
+    // One-pole high-pass sections, corner AUDIO_HP_HZ. This used to sit at
+    // R = 0.985, i.e. about 19 Hz at 8 kHz - a DC blocker, not a filter.
+    // Measurement of a live session showed the noise floor is 85% concentrated
+    // below 500 Hz (boom and handling rumble, not hiss), and 19 Hz removed none
+    // of it.
     const float R = 1.0f / (1.0f + 6.2831853f * AUDIO_HP_HZ / (float)AUDIO_SAMPLE_RATE);
 
+    float x1 = state->hp_x[0], y1 = state->hp_y[0];
+    float x2 = state->hp_x[1], y2 = state->hp_y[1];
     for (size_t i = 0; i < count; i++) {
         float x = (float)samples[i];
-        float y = x - x_prev + R * y_prev;
-        x_prev = x;
-        y_prev = y;
+        float a = x - x1 + R * y1;
+        x1 = x;
+        y1 = a;
+        float y = a - x2 + R * y2;
+        x2 = a;
+        y2 = y;
 
         if (y > 32767.0f) y = 32767.0f;
         else if (y < -32768.0f) y = -32768.0f;
         samples[i] = (int16_t)y;
     }
-
-    state->dc_x = x_prev;
-    state->dc_y = y_prev;
+    state->hp_x[0] = x1; state->hp_y[0] = y1;
+    state->hp_x[1] = x2; state->hp_y[1] = y2;
 }

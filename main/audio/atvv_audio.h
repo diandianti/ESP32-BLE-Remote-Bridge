@@ -84,8 +84,20 @@ void atvv_audio_payload_ready(const uint8_t *payload, size_t len);
 /** @brief Copy the current statistics. */
 void atvv_audio_get_stats(atvv_audio_stats_t *out_stats);
 
+/**
+ * @brief Sink for a frame's ADPCM sync word.
+ *
+ * Implemented by the BLE layer. Called before the frame's payload is handed to
+ * atvv_audio_payload_ready(), so the decoder starts every frame from the
+ * encoder's own predictor and step index.
+ */
+void atvv_audio_sync_ready(int16_t predictor, int8_t step_index);
+
 /** @brief True once at least one valid ATVV header has been seen. */
 bool atvv_audio_header_detected(void);
+
+/** @brief True when the stream uses the sequence-numbered frame header. */
+bool atvv_audio_seq_framed(void);
 
 #ifdef __cplusplus
 }
